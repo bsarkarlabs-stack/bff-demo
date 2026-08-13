@@ -20,7 +20,8 @@ doesn't need a redo later":
 | ACR: one shared registry vs. one per environment | **One shared ACR** (`acrbffeus`, in its own resource group) | The whole point of image tagging by git SHA (PRD §12) is *build once, promote the same artifact* from non-prod to prod. A separate ACR per environment forces rebuilding (or manually copying) the image for prod — that's exactly the drift the PRD is trying to avoid. Access is still segregated by RBAC: non-prod's identity gets `AcrPush`+`AcrPull`, prod's identity gets `AcrPull` only. |
 | Runtime identity vs. deployment identity | **Two separate identities per environment** | The identity GitHub Actions federates into (needs to push images / update the app) is not the same identity the *running container* uses (needs to read Key Vault secrets). Collapsing them into one would give the app's runtime more privilege than it needs — violates least-privilege (PRD §26). |
 | GitHub → Azure auth | **User-Assigned Managed Identity + federated credential (OIDC)**, not an App Registration/Service Principal | UAMIs support federated identity credentials directly since Azure added workload-identity federation to them — no client secret to rotate or leak, one less resource type to manage than a full App Registration. |
-| Redis auth | Access key stored **in Key Vault**, container pulls it via its own managed identity's Key Vault access | Azure Cache for Redis Entra ID (passwordless) auth exists but isn't uniformly GA across all tiers/SDKs yet. Key-in-Key-Vault is the pragmatic POC-to-prod-safe default the PRD already describes (§13); it still means the key is never in source, env vars, or the image. |
+| Redis service | **Azure Managed Redis** (`az redisenterprise`, `Balanced_B0` SKU), not classic Azure Cache for Redis | Microsoft has been steering new deployments to Azure Managed Redis — it's built on the Redis Enterprise engine, generally better price/performance than the classic Basic/Standard/Premium tiers, and is the service Microsoft is investing in going forward. Deploying the classic tier today would mean a forced migration later; provisioning Managed Redis now is the "doesn't need a redo" choice. Created with `--clustering-policy NoCluster` so the app's plain (non-cluster-aware) `redis-py` client works unchanged. |
+| Redis auth | Access key stored **in Key Vault**, container pulls it via its own managed identity's Key Vault access | Entra ID (passwordless) auth for Redis exists but isn't uniformly simple across every client SDK yet. Key-in-Key-Vault is the pragmatic POC-to-prod-safe default the PRD already describes (§13); it still means the key is never in source, env vars, or the image. |
 | Networking | **Public endpoints, POC-wide** | Matches PRD §27 explicitly — VNet/Private Endpoint is called out as future hardening, not a POC blocker. Everything below is written so adding Private Endpoints later doesn't change resource names, only adds NICs/DNS. |
 | Non-Prod topology | **One Container App, one Redis, one Key Vault shared by DEV/QA/UAT**, hostname-routed | Directly per PRD §7. Production always gets its own copy of everything. |
 
@@ -45,7 +46,7 @@ type forbids them). Project = `bff`, region = `eus` (East US).
 | Container Registry | `acrbffeus` (in `rg-bff-shared-eus`) | *(same, shared)* | globally unique, no hyphens |
 | Container Apps Environment | `cae-bff-np-eus` | `cae-bff-prod-eus` | |
 | Container App | `ca-bff-np-eus` | `ca-bff-prod-eus` | |
-| Azure Cache for Redis | `redis-bff-np-eus` | `redis-bff-prod-eus` | |
+| Azure Managed Redis (redisenterprise cluster) | `redis-bff-np-eus` | `redis-bff-prod-eus` | `Balanced_B0`, `NoCluster` policy, default database |
 | Key Vault | `kv-bff-np-eus` | `kv-bff-prod-eus` | globally unique, ≤24 chars |
 | Log Analytics Workspace | `law-bff-np-eus` | `law-bff-prod-eus` | |
 | Application Insights | `appi-bff-np-eus` | `appi-bff-prod-eus` | |
@@ -200,20 +201,35 @@ az keyvault secret set --vault-name kv-bff-np-eus --name oauth-client-id --value
 az keyvault secret set --vault-name kv-bff-np-eus --name oauth-client-secret --value "<client-secret>"
 ```
 
-### 4.7 Azure Cache for Redis
+### 4.7 Azure Managed Redis
+
+Uses the `redisenterprise` extension (auto-installs on first use) rather than the classic
+`az redis create` — see §1's design decision on why. `--clustering-policy NoCluster` keeps
+the wire protocol compatible with the app's plain `redis-py` client (no cluster-aware
+client needed for a single key per request, which is all this app does).
 
 ```powershell
 foreach ($ENV in @("np","prod")) {
   $RG = "rg-bff-$ENV-eus"
-  az redis create -g $RG -n "redis-bff-$ENV-eus" -l $LOCATION --sku Basic --vm-size c0
 
-  $KEY = az redis list-keys -g $RG -n "redis-bff-$ENV-eus" --query primaryKey -o tsv
+  az redisenterprise create --cluster-name "redis-bff-$ENV-eus" -g $RG -l $LOCATION `
+    --sku Balanced_B0 --minimum-tls-version "1.2" --public-network-access Enabled `
+    --clustering-policy NoCluster --client-protocol Encrypted
+
+  $HOST = az redisenterprise show -g $RG --cluster-name "redis-bff-$ENV-eus" --query hostName -o tsv
+  $PORT = az redisenterprise database show -g $RG --cluster-name "redis-bff-$ENV-eus" --database-name default --query port -o tsv
+  $KEY = az redisenterprise database list-keys -g $RG --cluster-name "redis-bff-$ENV-eus" --database-name default --query primaryKey -o tsv
+
   az keyvault secret set --vault-name "kv-bff-$ENV-eus" --name redis-access-key --value $KEY
+  Write-Output "redis-bff-$ENV-eus -> $HOST`:$PORT"
 }
 ```
 
-`Basic/C0` is a POC size — undersized for prod concurrency. Revisit tier/size once real
-load numbers exist (PRD §21 sizing note).
+`Balanced_B0` is the smallest Managed Redis SKU — a reasonable POC size, still undersized
+for prod concurrency. Revisit tier/size once real load numbers exist (PRD §21 sizing note).
+Unlike classic Azure Cache for Redis, the port is dynamically assigned per database (not a
+fixed 6380) — capture it from `az redisenterprise database show` rather than hardcoding it,
+and set `REDIS_PORT` on the Container App accordingly (§4.9).
 
 ### 4.8 Container Apps Environment
 
@@ -236,6 +252,8 @@ $RUNTIME_ID = az identity show -g $RG -n "id-bff-runtime-$ENV-eus" --query id -o
 $RUNTIME_CLIENT_ID = az identity show -g $RG -n "id-bff-runtime-$ENV-eus" --query clientId -o tsv
 $APPI_CONN = az monitor app-insights component show -g $RG -a "appi-bff-$ENV-eus" --query connectionString -o tsv
 $REDIS_KEY = az keyvault secret show --vault-name "kv-bff-$ENV-eus" --name redis-access-key --query value -o tsv
+$REDIS_HOST = az redisenterprise show -g $RG --cluster-name "redis-bff-$ENV-eus" --query hostName -o tsv
+$REDIS_PORT = az redisenterprise database show -g $RG --cluster-name "redis-bff-$ENV-eus" --database-name default --query port -o tsv
 
 az containerapp create -g $RG -n "ca-bff-$ENV-eus" `
   --environment "cae-bff-$ENV-eus" `
@@ -249,8 +267,8 @@ az containerapp create -g $RG -n "ca-bff-$ENV-eus" `
   --secrets "redis-key=$REDIS_KEY" `
   --env-vars `
     "ENVIRONMENT=dev" `
-    "REDIS_HOST=redis-bff-$ENV-eus.redis.cache.windows.net" `
-    "REDIS_PORT=6380" `
+    "REDIS_HOST=$REDIS_HOST" `
+    "REDIS_PORT=$REDIS_PORT" `
     "REDIS_SSL=true" `
     "KEY_VAULT_URL=https://kv-bff-$ENV-eus.vault.azure.net/" `
     "AZURE_CLIENT_ID=$RUNTIME_CLIENT_ID" `
@@ -263,9 +281,10 @@ Notes:
 - `AZURE_CLIENT_ID` tells `DefaultAzureCredential` which user-assigned identity to use, since
   the app has more than one identity available at the environment level once both runtime
   and deploy identities exist in the same resource group.
-- `REDIS_PORT=6380` + `REDIS_SSL=true` because Azure Cache for Redis's non-TLS port (6379) is
-  disabled by default — the app's `config.py` already exposes `REDIS_SSL`, so no code change
-  needed.
+- `REDIS_PORT` is pulled dynamically (Managed Redis assigns it per database, unlike classic
+  Azure Cache for Redis's fixed 6380) and `REDIS_SSL=true` since the client protocol was
+  created as `Encrypted` (§4.7) — the app's `config.py` already exposes both as settings, so
+  no code change needed.
 - Repeat for `prod`, pointed at `rg-bff-prod-eus` resources, and drop `bootstrap`/`dev`
   accordingly once the pipeline exists.
 
