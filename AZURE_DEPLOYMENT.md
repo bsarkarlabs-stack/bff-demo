@@ -212,13 +212,23 @@ client needed for a single key per request, which is all this app does).
 foreach ($ENV in @("np","prod")) {
   $RG = "rg-bff-$ENV-eus"
 
+  # 1. Cluster (this alone does NOT reliably provision the default database — create it explicitly next)
   az redisenterprise create --cluster-name "redis-bff-$ENV-eus" -g $RG -l $LOCATION `
-    --sku Balanced_B0 --minimum-tls-version "1.2" --public-network-access Enabled `
-    --clustering-policy NoCluster --client-protocol Encrypted
+    --sku Balanced_B0 --minimum-tls-version "1.2" --public-network-access Enabled
+
+  # 2. Database — note: this CLI extension takes no --database-name flag; there is exactly
+  #    one database per cluster and it's implicitly named "default"
+  az redisenterprise database create -g $RG --cluster-name "redis-bff-$ENV-eus" `
+    --clustering-policy NoCluster --client-protocol Encrypted --eviction-policy VolatileLRU
+
+  # 3. Access keys default to Disabled as of this CLI version — enable explicitly, since the
+  #    app authenticates with a key (§1 design decision), not Entra ID
+  az redisenterprise database update -g $RG --cluster-name "redis-bff-$ENV-eus" `
+    --access-keys-authentication Enabled
 
   $HOST = az redisenterprise show -g $RG --cluster-name "redis-bff-$ENV-eus" --query hostName -o tsv
-  $PORT = az redisenterprise database show -g $RG --cluster-name "redis-bff-$ENV-eus" --database-name default --query port -o tsv
-  $KEY = az redisenterprise database list-keys -g $RG --cluster-name "redis-bff-$ENV-eus" --database-name default --query primaryKey -o tsv
+  $PORT = az redisenterprise database show -g $RG --cluster-name "redis-bff-$ENV-eus" --query port -o tsv
+  $KEY = az redisenterprise database list-keys -g $RG --cluster-name "redis-bff-$ENV-eus" --query primaryKey -o tsv
 
   az keyvault secret set --vault-name "kv-bff-$ENV-eus" --name redis-access-key --value $KEY
   Write-Output "redis-bff-$ENV-eus -> $HOST`:$PORT"
@@ -229,7 +239,9 @@ foreach ($ENV in @("np","prod")) {
 for prod concurrency. Revisit tier/size once real load numbers exist (PRD §21 sizing note).
 Unlike classic Azure Cache for Redis, the port is dynamically assigned per database (not a
 fixed 6380) — capture it from `az redisenterprise database show` rather than hardcoding it,
-and set `REDIS_PORT` on the Container App accordingly (§4.9).
+and set `REDIS_PORT` on the Container App accordingly (§4.9). The app also needs the key
+itself as `REDIS_PASSWORD` (via `secretref:redis-key`, §4.9) — Managed Redis requires
+authentication on connect, unlike a bare local Redis container.
 
 ### 4.8 Container Apps Environment
 
@@ -253,7 +265,7 @@ $RUNTIME_CLIENT_ID = az identity show -g $RG -n "id-bff-runtime-$ENV-eus" --quer
 $APPI_CONN = az monitor app-insights component show -g $RG -a "appi-bff-$ENV-eus" --query connectionString -o tsv
 $REDIS_KEY = az keyvault secret show --vault-name "kv-bff-$ENV-eus" --name redis-access-key --query value -o tsv
 $REDIS_HOST = az redisenterprise show -g $RG --cluster-name "redis-bff-$ENV-eus" --query hostName -o tsv
-$REDIS_PORT = az redisenterprise database show -g $RG --cluster-name "redis-bff-$ENV-eus" --database-name default --query port -o tsv
+$REDIS_PORT = az redisenterprise database show -g $RG --cluster-name "redis-bff-$ENV-eus" --query port -o tsv
 
 az containerapp create -g $RG -n "ca-bff-$ENV-eus" `
   --environment "cae-bff-$ENV-eus" `
@@ -270,10 +282,17 @@ az containerapp create -g $RG -n "ca-bff-$ENV-eus" `
     "REDIS_HOST=$REDIS_HOST" `
     "REDIS_PORT=$REDIS_PORT" `
     "REDIS_SSL=true" `
+    "REDIS_PASSWORD=secretref:redis-key" `
     "KEY_VAULT_URL=https://kv-bff-$ENV-eus.vault.azure.net/" `
     "AZURE_CLIENT_ID=$RUNTIME_CLIENT_ID" `
     "APPLICATIONINSIGHTS_CONNECTION_STRING=$APPI_CONN"
 ```
+
+Note: `az redisenterprise database show`/`create` in the current CLI extension take no `--database-name`
+flag — the database name is implicit (there's exactly one per cluster, named `default`).
+Also note the Managed Redis database defaults to `accessKeysAuthentication: Disabled` as of
+this CLI version — enable it explicitly right after creating the database:
+`az redisenterprise database update -g $RG --cluster-name "redis-bff-$ENV-eus" --access-keys-authentication Enabled`.
 
 Notes:
 - `--image ...:bootstrap` is a placeholder — the real image tag lands via the GitHub Actions

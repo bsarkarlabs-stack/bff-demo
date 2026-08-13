@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     redis_host: str = "localhost"
     redis_port: int = 6379
     redis_ssl: bool = False
+    redis_password: str | None = None
 
     key_vault_url: str | None = None
     oauth_client_id_secret_name: str = "oauth-client-id"
