@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(wsl -l -v)",
-      "PowerShell(wsl -d Ubuntu-24.04 -- bash -lc \"wslpath 'd:\\\\bff-demo'\")"
-    ]
-  }
-}
