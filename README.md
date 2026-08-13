@@ -57,7 +57,7 @@ via GitHub OIDC (no long-lived service principal secrets). Requires these repo/e
 secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `ACR_NAME`,
 `CONTAINER_APP_NAME`, `RESOURCE_GROUP`, `CONTAINER_APP_URL`.
 
-`develop` deploys to the non-production Container App; `main` deploys to production
+`develop` deploys to the non-production Container App; `master` deploys to production
 (gated by the GitHub `production` environment's required reviewers).
 
 ## Azure deployment

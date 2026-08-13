@@ -125,7 +125,7 @@ foreach ($ENV in @("np","prod")) {
 
 ### 4.3 GitHub OIDC federation (on each deploy identity)
 
-Repeat per environment, mapping branch → environment (`develop` → np, `main` → prod), per
+Repeat per environment, mapping branch → environment (`develop` → np, `master` → prod), per
 PRD §20:
 
 ```powershell
@@ -143,7 +143,7 @@ az identity federated-credential create `
 ```
 
 For prod, use identity `id-bff-deploy-prod-eus` and subject
-`repo:<github-org>/<repo>:ref:refs/heads/main`. If deployments run from a GitHub
+`repo:<github-org>/<repo>:ref:refs/heads/master`. If deployments run from a GitHub
 *Environment* (recommended for prod, so required reviewers gate it), use
 `repo:<org>/<repo>:environment:production` as the subject instead.
 
