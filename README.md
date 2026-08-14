@@ -8,6 +8,7 @@ caching.
 - Local test steps (WSL Ubuntu + Docker Desktop) → [TESTING.md](TESTING.md)
 - Azure resource naming, RBAC/identity model, and step-by-step `az cli` setup → [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md)
 - GitHub Actions ↔ Azure OIDC wiring, step-by-step, with a troubleshooting table from the real first run → [CICD_SETUP.md](CICD_SETUP.md)
+- Why every architecture decision was made (not just how to run it) → [ARCHITECTURE_CONCEPTS.md](ARCHITECTURE_CONCEPTS.md)
 
 ## Layout
 
