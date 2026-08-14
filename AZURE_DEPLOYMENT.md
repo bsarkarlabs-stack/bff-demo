@@ -126,16 +126,37 @@ foreach ($ENV in @("np","prod")) {
 
 ### 4.3 GitHub OIDC federation (on each deploy identity)
 
+The `deploy` job in `ci-cd.yml` always sets `environment: non-production` or
+`environment: production` (PRD §20's reviewer-gating requirement for prod). **Whenever a
+job specifies `environment:`, GitHub Actions changes the OIDC token's `sub` claim to
+`repo:<org>/<repo>:environment:<name>` instead of the ref-based
+`repo:<org>/<repo>:ref:refs/heads/<branch>` claim** — federating against the ref-based
+subject (the more commonly-documented pattern) will fail with
+`AADSTS700213: No matching federated identity record found`, discovered the hard way on
+the first real pipeline run.
+
+A second, less-documented wrinkle: as of this GitHub platform version, the `<org>` and
+`<repo>` segments of that subject are **not** the plain names — they include the
+immutable numeric org/repo IDs, e.g. `bsarkarlabs-stack@316735306/bff-demo@1333575135`,
+even with `use_immutable_subject: false`. Don't guess the subject string — fetch the exact
+prefix GitHub will present:
+
+```powershell
+gh api repos/<org>/<repo>/actions/oidc/customization/sub
+# -> {"use_default":true,"use_immutable_subject":false,"sub_claim_prefix":"repo:<org>@<id>/<repo>@<id>"}
+```
+
 Repeat per environment, mapping branch → environment (`develop` → np, `master` → prod), per
 PRD §20:
 
 ```powershell
 $RG = "rg-bff-np-eus"
 $IDENTITY = "id-bff-deploy-np-eus"
-$SUBJECT = "repo:<github-org>/<repo>:ref:refs/heads/develop"
+$SUB_PREFIX = gh api repos/<org>/<repo>/actions/oidc/customization/sub --jq ".sub_claim_prefix"
+$SUBJECT = "$SUB_PREFIX`:environment:non-production"
 
 az identity federated-credential create `
-  --name "gh-oidc-np" `
+  --name "gh-oidc-np-environment" `
   --identity-name $IDENTITY `
   --resource-group $RG `
   --issuer "https://token.actions.githubusercontent.com" `
@@ -144,9 +165,7 @@ az identity federated-credential create `
 ```
 
 For prod, use identity `id-bff-deploy-prod-eus` and subject
-`repo:<github-org>/<repo>:ref:refs/heads/master`. If deployments run from a GitHub
-*Environment* (recommended for prod, so required reviewers gate it), use
-`repo:<org>/<repo>:environment:production` as the subject instead.
+`<sub_claim_prefix>:environment:production`.
 
 ### 4.4 Container Registry (shared)
 
@@ -307,6 +326,20 @@ Notes:
 - Repeat for `prod`, pointed at `rg-bff-prod-eus` resources, and drop `bootstrap`/`dev`
   accordingly once the pipeline exists.
 
+**The deploy identity still can't deploy yet.** §4.4 only granted it `AcrPush`/`AcrPull` —
+it has no permission to touch the Container App itself. Without this, `az containerapp
+update` in the pipeline fails with `ERROR: The containerapp '***' does not exist` — Azure
+Resource Manager returns a 404-shaped error for RBAC-denied reads rather than a 403, so the
+failure reads like a naming/scope bug instead of a permissions one. Grant it scoped to just
+this app (least privilege — not the whole resource group):
+
+```powershell
+$CA_ID = az containerapp show -g $RG -n "ca-bff-$ENV-eus" --query id -o tsv
+$DEPLOY_PRINCIPAL = az identity show -g $RG -n "id-bff-deploy-$ENV-eus" --query principalId -o tsv
+az role assignment create --assignee-object-id $DEPLOY_PRINCIPAL --assignee-principal-type ServicePrincipal `
+  --role "Container Apps Contributor" --scope $CA_ID
+```
+
 Domain binding (custom hostnames from PRD §7) is a separate, one-time step per environment
 via `az containerapp hostname add` + `az containerapp hostname bind`, done once DNS/TLS
 cert ownership is sorted — not blocking for POC (Container Apps' default
@@ -314,9 +347,13 @@ cert ownership is sorted — not blocking for POC (Container Apps' default
 
 ### 4.10 GitHub repo/environment secrets
 
-Set these in the GitHub repo (Settings → Secrets and variables → Actions), split into a
-`non-production` and `production` **Environment** so `main` deploys can require reviewer
-approval (PRD §20):
+Create the GitHub **Environments** first (their names must exactly match the `environment:`
+values the workflow computes — `non-production` and `production`), then set secrets scoped
+to each one, so a `master` deploy can never see non-prod's identity or vice versa:
+
+```powershell
+gh api --method PUT repos/<org>/<repo>/environments/non-production
+```
 
 | Secret | Non-Prod value | Prod value |
 |---|---|---|
@@ -329,7 +366,30 @@ approval (PRD §20):
 | `CONTAINER_APP_URL` | its `*.azurecontainerapps.io` FQDN | its FQDN |
 
 These map directly onto the secrets already referenced in
-[.github/workflows/ci-cd.yml](.github/workflows/ci-cd.yml).
+[.github/workflows/ci-cd.yml](.github/workflows/ci-cd.yml). `master` deploys to production
+(PRD §20's reviewer-gating requirement — enforce with required reviewers on the
+`production` Environment); the repo's default branch here is `master`, not `main`.
+
+**Use `printf`, not `echo`, when piping values into `gh secret set`.** `echo "$VALUE" | gh
+secret set NAME` stores the trailing newline `echo` appends as part of the secret — e.g.
+`CONTAINER_APP_NAME` becomes `"ca-bff-np-eus\n"`. Every downstream `az` command lookup
+then fails with a not-found-shaped error even though the resource obviously exists, which
+reads like an RBAC or naming bug, not a whitespace one:
+
+```powershell
+printf '%s' "ca-bff-np-eus" | gh secret set CONTAINER_APP_NAME --env non-production --repo <org>/<repo>
+```
+
+### 4.11 CI/CD workflow gotchas hit on the first real run
+
+- `aquasecurity/trivy-action` tags are `v`-prefixed (`v0.36.0`, not `0.36.0`) — an unprefixed
+  pin fails at `Unable to resolve action` before the job even starts.
+- Trivy will find real CVEs in the Debian base image with **no fix published yet**
+  (`Fixed Version` blank in its table). Gating `exit-code: 1` on those permanently blocks
+  CI. Set `ignore-unfixed: true` so the scan only fails on vulnerabilities that are
+  actually fixable — then fix the ones it does report (here: bumping `fastapi` to pull a
+  patched `starlette`, since `fastapi==0.115.0` pinned `starlette<0.39.0`, which had known
+  CVEs).
 
 ---
 
