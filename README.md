@@ -7,6 +7,7 @@ caching.
 
 - Local test steps (WSL Ubuntu + Docker Desktop) → [TESTING.md](TESTING.md)
 - Azure resource naming, RBAC/identity model, and step-by-step `az cli` setup → [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md)
+- GitHub Actions ↔ Azure OIDC wiring, step-by-step, with a troubleshooting table from the real first run → [CICD_SETUP.md](CICD_SETUP.md)
 
 ## Layout
 
@@ -58,7 +59,9 @@ secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `ACR_NAM
 `CONTAINER_APP_NAME`, `RESOURCE_GROUP`, `CONTAINER_APP_URL`.
 
 `develop` deploys to the non-production Container App; `master` deploys to production
-(gated by the GitHub `production` environment's required reviewers).
+(gated by the GitHub `production` environment's required reviewers). See
+[CICD_SETUP.md](CICD_SETUP.md) for the full setup procedure and a troubleshooting table
+covering every issue hit getting this pipeline green for real.
 
 ## Azure deployment
 
