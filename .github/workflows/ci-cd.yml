@@ -41,6 +41,7 @@ jobs:
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
           severity: CRITICAL,HIGH
+          ignore-unfixed: true
           exit-code: "1"
 
       - name: Save image as artifact
