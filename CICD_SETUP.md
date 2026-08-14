@@ -2,13 +2,13 @@
 
 How to wire GitHub Actions to deploy this repo to Azure Container Apps via OIDC, with
 every step actually run and verified against the real `bsarkarlabs-stack/bff-demo` repo
-and the `np` (non-production) Azure environment. Production follows the identical pattern
-against `rg-bff-prod-eus` — see [§8](#8-doing-this-for-production).
+and the Non-Prod Azure environment (`rg-colourcon-bbf-np-eus`). Production follows the
+identical pattern against `rg-colorcon-bff-prod-eus` — see [§8](#8-doing-this-for-production).
 
 This assumes the Azure resources in [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md) already
-exist (`rg-bff-np-eus`, `acrbffeus`, `ca-bff-np-eus`, the `id-bff-deploy-np-eus` /
-`id-bff-runtime-np-eus` identities, etc.). This doc is only about the GitHub↔Azure wiring
-on top of that.
+exist (`rg-colourcon-bbf-np-eus`, the interim `acrbffeus`, `ca-colorcon-bff-np-eus`, the
+`id-colorcon-bff-deploy-np-eus` / `id-colorcon-bff-runtime-np-eus` identities, etc.). This
+doc is only about the GitHub↔Azure wiring on top of that.
 
 ---
 
@@ -31,15 +31,15 @@ GitHub Actions: deploy job (environment: non-production)
                                                                  |
                                                                  v
   - az login (OIDC) <----------------------------------- short-lived Azure token
-  - az acr login, docker push -----------------------------> acrbffeus
-  - az containerapp update --image ... ----------------------> ca-bff-np-eus
+  - az acr login, docker push -----------------------------> acrbffeus (interim, shared)
+  - az containerapp update --image ... ----------------------> ca-colorcon-bff-np-eus
   - curl .../health -----------------------------------------> confirms the new revision is live
 ```
 
 No Azure credential is ever stored in GitHub. The `deploy` job exchanges a GitHub-issued
 OIDC token for a short-lived Azure token, via a **federated identity credential** on the
-`id-bff-deploy-np-eus` managed identity that says "trust tokens GitHub issues for this
-repo's `non-production` environment."
+`id-colorcon-bff-deploy-np-eus` managed identity that says "trust tokens GitHub issues for
+this repo's `non-production` environment."
 
 ---
 
@@ -92,12 +92,18 @@ SUB_PREFIX=$(gh api repos/bsarkarlabs-stack/bff-demo/actions/oidc/customization/
 
 az identity federated-credential create \
   --name gh-oidc-np-environment \
-  --identity-name id-bff-deploy-np-eus \
-  --resource-group rg-bff-np-eus \
+  --identity-name id-colorcon-bff-deploy-np-eus \
+  --resource-group rg-colourcon-bbf-np-eus \
   --issuer https://token.actions.githubusercontent.com \
   --subject "${SUB_PREFIX}:environment:non-production" \
   --audiences api://AzureADTokenExchange
 ```
+
+This has been created and re-created twice in this project — once against the old (now
+deleted) `id-bff-deploy-np-eus`, then again here against `id-colorcon-bff-deploy-np-eus`
+after the resource rebuild. The subject prefix itself stayed identical both times (it's a
+property of the GitHub repo, not the Azure identity) — only `--identity-name` and
+`--resource-group` changed.
 
 ---
 
@@ -111,7 +117,7 @@ failing.
 
 ```bash
 ACR_ID=$(az acr show -n acrbffeus --query id -o tsv)
-DEPLOY_PRINCIPAL=$(az identity show -g rg-bff-np-eus -n id-bff-deploy-np-eus --query principalId -o tsv)
+DEPLOY_PRINCIPAL=$(az identity show -g rg-colourcon-bbf-np-eus -n id-colorcon-bff-deploy-np-eus --query principalId -o tsv)
 
 az role assignment create --assignee-object-id "$DEPLOY_PRINCIPAL" \
   --assignee-principal-type ServicePrincipal --role AcrPush --scope "$ACR_ID"
@@ -132,7 +138,7 @@ existence to callers who can't see it. Scope the grant to just this one app (lea
 privilege, not the whole resource group):
 
 ```bash
-CA_ID=$(az containerapp show -g rg-bff-np-eus -n ca-bff-np-eus --query id -o tsv)
+CA_ID=$(az containerapp show -g rg-colourcon-bbf-np-eus -n ca-colorcon-bff-np-eus --query id -o tsv)
 
 az role assignment create --assignee-object-id "$DEPLOY_PRINCIPAL" \
   --assignee-principal-type ServicePrincipal --role "Container Apps Contributor" --scope "$CA_ID"
@@ -157,32 +163,35 @@ deploy can never see non-prod's identity, or vice versa):
 
 | Secret | Value (non-production) |
 |---|---|
-| `AZURE_CLIENT_ID` | `id-bff-deploy-np-eus` client ID |
+| `AZURE_CLIENT_ID` | `id-colorcon-bff-deploy-np-eus` client ID |
 | `AZURE_TENANT_ID` | the Azure AD tenant ID |
 | `AZURE_SUBSCRIPTION_ID` | the subscription ID |
-| `ACR_NAME` | `acrbffeus` |
-| `RESOURCE_GROUP` | `rg-bff-np-eus` |
-| `CONTAINER_APP_NAME` | `ca-bff-np-eus` |
+| `ACR_NAME` | `acrbffeus` (interim, shared) |
+| `RESOURCE_GROUP` | `rg-colourcon-bbf-np-eus` |
+| `CONTAINER_APP_NAME` | `ca-colorcon-bff-np-eus` |
 | `CONTAINER_APP_URL` | the app's `https://...azurecontainerapps.io` FQDN |
 
 **Use `printf`, not `echo`, piping into `gh secret set`.** `echo` appends a trailing
 newline that becomes part of the stored secret value (`CONTAINER_APP_NAME` silently becomes
-`"ca-bff-np-eus\n"`), and every downstream `az` lookup then fails with the same
-not-found-shaped error as §4.2 — easy to mis-diagnose as another RBAC gap.
+`"ca-colorcon-bff-np-eus\n"`), and every downstream `az` lookup then fails with the same
+not-found-shaped error as §4.2 — easy to mis-diagnose as another RBAC gap. This was hit
+for real the first time these secrets were set, using the exact `echo | gh secret set`
+pattern below in the "don't do this" form.
 
 ```bash
 REPO=bsarkarlabs-stack/bff-demo
+RG=rg-colourcon-bbf-np-eus
 
-printf '%s' "$(az identity show -g rg-bff-np-eus -n id-bff-deploy-np-eus --query clientId -o tsv)" \
+printf '%s' "$(az identity show -g "$RG" -n id-colorcon-bff-deploy-np-eus --query clientId -o tsv)" \
   | gh secret set AZURE_CLIENT_ID --env non-production --repo "$REPO"
 printf '%s' "$(az account show --query tenantId -o tsv)" \
   | gh secret set AZURE_TENANT_ID --env non-production --repo "$REPO"
 printf '%s' "$(az account show --query id -o tsv)" \
   | gh secret set AZURE_SUBSCRIPTION_ID --env non-production --repo "$REPO"
 printf '%s' "acrbffeus" | gh secret set ACR_NAME --env non-production --repo "$REPO"
-printf '%s' "rg-bff-np-eus" | gh secret set RESOURCE_GROUP --env non-production --repo "$REPO"
-printf '%s' "ca-bff-np-eus" | gh secret set CONTAINER_APP_NAME --env non-production --repo "$REPO"
-printf '%s' "https://ca-bff-np-eus.<env-id>.eastus.azurecontainerapps.io" \
+printf '%s' "$RG" | gh secret set RESOURCE_GROUP --env non-production --repo "$REPO"
+printf '%s' "ca-colorcon-bff-np-eus" | gh secret set CONTAINER_APP_NAME --env non-production --repo "$REPO"
+printf '%s' "https://<container-app-fqdn>" \
   | gh secret set CONTAINER_APP_URL --env non-production --repo "$REPO"
 
 gh secret list --env non-production --repo "$REPO"
@@ -231,15 +240,16 @@ Expect both jobs green, ending with the `deploy` job's `Health check` step succe
 Confirm independently:
 
 ```bash
-curl https://ca-bff-np-eus.<env-id>.eastus.azurecontainerapps.io/health
+curl https://<container-app-fqdn>/health
 ```
 
 ---
 
 ## Troubleshooting quick reference
 
-All five of these were hit for real getting this repo's pipeline green — not
-hypothetical.
+All of these were hit for real getting this repo's pipeline green — not hypothetical, and
+several of them twice (once against the original environment, again against the rebuilt
+`colorcon`-named one).
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -256,16 +266,16 @@ hypothetical.
 ## 8. Doing this for production
 
 Identical steps, swapped inputs — not yet done for this repo (no `production` GitHub
-Environment, secrets, or federated credential exist yet):
+Environment, secrets, or federated credential exist yet, and the Production Azure
+resources themselves don't exist yet either — see AZURE_DEPLOYMENT.md §6):
 
-- Identity: `id-bff-deploy-prod-eus` in `rg-bff-prod-eus`
+- Identity: `id-colorcon-bff-deploy-prod-eus` in `rg-colorcon-bff-prod-eus`
 - Federated credential subject: `<sub_claim_prefix>:environment:production`
 - GitHub Environment: `production` — add **required reviewers** here (Settings →
   Environments → production → Deployment protection rules), so `master` pushes pause for
-  approval before deploying, per PRD §20's promotion-gate requirement. This is the one
-  meaningful difference from non-prod's setup.
-- RBAC: `AcrPull` only on `acrbffeus` (prod doesn't build its own images — PRD §12/§1's
-  build-once-promote model means it deploys an image non-prod's pipeline already pushed),
-  plus `Container Apps Contributor` scoped to `ca-bff-prod-eus`.
+  approval before deploying. This is the one meaningful difference from non-prod's setup.
+- RBAC: `AcrPull` only on the shared ACR (prod doesn't build its own images —
+  build-once-promote means it deploys an image non-prod's pipeline already pushed), plus
+  `Container Apps Contributor` scoped to `ca-colorcon-bff-prod-eus`.
 - Secrets: same seven keys, scoped to the `production` Environment, pointed at
-  `rg-bff-prod-eus` / `ca-bff-prod-eus` / that app's FQDN.
+  `rg-colorcon-bff-prod-eus` / `ca-colorcon-bff-prod-eus` / that app's FQDN.
