@@ -46,8 +46,8 @@ repo's `non-production` environment."
 ## 2. Prerequisites
 
 - `gh` CLI authenticated (`gh auth status`) with `repo` and `workflow` scopes.
-- `az` CLI logged into the subscription that holds `rg-bff-np-eus`.
-- The Azure resources from AZURE_DEPLOYMENT.md §4.1–4.9 already exist.
+- `az` CLI logged into the subscription that holds `rg-colourcon-bbf-np-eus`.
+- The Azure resources from AZURE_DEPLOYMENT.md §4.1–4.10 already exist.
 
 ---
 

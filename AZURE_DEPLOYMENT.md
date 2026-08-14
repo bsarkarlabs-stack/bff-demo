@@ -1,425 +1,578 @@
 # Azure Deployment Plan — BFF Auth Service
 
-Target: a secure, repeatable, enterprise-shaped-but-POC-sized Azure footprint for the
-Python BFF, deployable via `az cli` today and liftable into Bicep/Terraform later without
-renaming anything.
+Every command in this document has actually been run against a real Azure subscription and
+verified working, in this exact order, for the Non-Prod environment. Where the first
+attempt failed, the failure and fix are documented inline rather than smoothed over —
+that's what made this a reliable runbook instead of a guess.
 
-This is the execution plan for PRD sections 7–13, 18–19, 21, 26 and the checklist in
-section 31. Read [TESTING.md](TESTING.md) first — this plan assumes the image already
-builds, runs, and passes health checks locally (it does, as of the last container test).
+This supersedes the original POC-shaped plan: Non-Prod is now built to the same
+architectural spec as Production (private networking, zone redundancy), just sized down
+for cost — see [ARCHITECTURE_CONCEPTS.md](ARCHITECTURE_CONCEPTS.md) §3.3 for why, and
+[issue #1](https://github.com/bsarkarlabs-stack/bff-demo/issues/1) for the full target
+architecture this executes. All commands are `bash`, run via `az cli` (WSL Ubuntu in this
+session) — not PowerShell; every command here was actually executed this way.
+
+Read [TESTING.md](TESTING.md) first — this plan assumes the image already builds, runs,
+and passes health checks locally.
 
 ---
 
 ## 1. Design decisions (and why)
 
-A few calls were made beyond what the PRD spells out literally, aimed at "simple now,
-doesn't need a redo later":
-
 | Decision | Choice | Why |
 |---|---|---|
-| ACR: one shared registry vs. one per environment | **One shared ACR** (`acrbffeus`, in its own resource group) | The whole point of image tagging by git SHA (PRD §12) is *build once, promote the same artifact* from non-prod to prod. A separate ACR per environment forces rebuilding (or manually copying) the image for prod — that's exactly the drift the PRD is trying to avoid. Access is still segregated by RBAC: non-prod's identity gets `AcrPush`+`AcrPull`, prod's identity gets `AcrPull` only. |
-| Runtime identity vs. deployment identity | **Two separate identities per environment** | The identity GitHub Actions federates into (needs to push images / update the app) is not the same identity the *running container* uses (needs to read Key Vault secrets). Collapsing them into one would give the app's runtime more privilege than it needs — violates least-privilege (PRD §26). |
-| GitHub → Azure auth | **User-Assigned Managed Identity + federated credential (OIDC)**, not an App Registration/Service Principal | UAMIs support federated identity credentials directly since Azure added workload-identity federation to them — no client secret to rotate or leak, one less resource type to manage than a full App Registration. |
-| Redis service | **Azure Managed Redis** (`az redisenterprise`, `Balanced_B0` SKU), not classic Azure Cache for Redis | Microsoft has been steering new deployments to Azure Managed Redis — it's built on the Redis Enterprise engine, generally better price/performance than the classic Basic/Standard/Premium tiers, and is the service Microsoft is investing in going forward. Deploying the classic tier today would mean a forced migration later; provisioning Managed Redis now is the "doesn't need a redo" choice. Created with `--clustering-policy NoCluster` so the app's plain (non-cluster-aware) `redis-py` client works unchanged. |
-| Redis auth | Access key stored **in Key Vault**, container pulls it via its own managed identity's Key Vault access | Entra ID (passwordless) auth for Redis exists but isn't uniformly simple across every client SDK yet. Key-in-Key-Vault is the pragmatic POC-to-prod-safe default the PRD already describes (§13); it still means the key is never in source, env vars, or the image. |
-| Networking | **Public endpoints, POC-wide** | Matches PRD §27 explicitly — VNet/Private Endpoint is called out as future hardening, not a POC blocker. Everything below is written so adding Private Endpoints later doesn't change resource names, only adds NICs/DNS. |
-| Non-Prod topology | **One Container App, one Redis, one Key Vault shared by DEV/QA/UAT**, hostname-routed | Directly per PRD §7. Production always gets its own copy of everything. |
+| ACR: one shared registry vs. one per environment | **One shared ACR** (`acrbffeus`, interim — see §2 naming note) | Build once, promote the same artifact — a separate ACR per environment forces rebuilding for prod, which is exactly the drift this is trying to avoid. Access is segregated by RBAC instead: non-prod's identity gets `AcrPush`+`AcrPull`, prod's gets `AcrPull` only. |
+| Runtime identity vs. deploy identity | **Two separate identities per environment** | The identity GitHub Actions federates into (push images / update the app) must never be the identity the *running container* uses (read Key Vault secrets) — collapsing them violates least-privilege. See ARCHITECTURE_CONCEPTS.md §5 for the near-miss that proved why this matters. |
+| GitHub → Azure auth | **User-Assigned Managed Identity + federated credential (OIDC)** | No client secret to leak or rotate. See CICD_SETUP.md for the full OIDC subject-format gotchas. |
+| Redis service | **Azure Managed Redis** (`az redisenterprise`, `Balanced_B0`), not classic Azure Cache for Redis | Microsoft's investment is in Managed Redis (Redis Enterprise engine) going forward; provisioning classic today just means a forced migration later. |
+| Redis auth | Access key stored **in Key Vault** | Entra ID (passwordless) auth for Redis isn't uniformly simple across client SDKs yet; key-in-Key-Vault keeps the key out of source/env/image either way. |
+| Networking | **Private VNet + Private Endpoints for Key Vault and Redis, in both Non-Prod and Prod** | Non-Prod's job is to prove Prod will work — if they have different network topology, a green Non-Prod deployment doesn't actually validate the thing most likely to break (the private DNS/network path). See ARCHITECTURE_CONCEPTS.md §3.3 and §11. |
+| Non-Prod scaling | `minReplicas=0, maxReplicas=1` | Cost-optimized per explicit direction. Trade-off: with <2 replicas, the environment's zone-redundant *setting* doesn't translate into actual cross-zone resilience (that needs ≥2 replicas) — accepted for Non-Prod, revisit for Prod. |
 
 ---
 
 ## 2. Naming convention
 
-Pattern: `<resource-type>-<project>-<environment>-<region>` (no hyphens where the resource
-type forbids them). Project = `bff`, region = `eus` (East US).
+Pattern: `<resource-type>-colorcon-bff-<environment>-<region>`. Project = `colorcon-bff`,
+region = `eus` (East US).
 
-| Environment token | Meaning |
-|---|---|
-| `np` | Non-production resource group / shared resources (routes DEV, QA, UAT by hostname) |
-| `prod` | Production |
-| `shared` | Cross-environment platform resources (currently: ACR only) |
+**Resource group naming exception:** the Non-Prod resource group was created as
+`rg-colourcon-bbf-np-eus` (a typo — "colourcon"/"bbf" instead of "colorcon"/"bff") and kept
+as-is rather than recreated, since renaming a resource group isn't a supported Azure
+operation without a full rebuild. **Every resource *inside* it uses the correct
+`colorcon-bff` spelling** — the typo doesn't propagate. Don't copy the RG name's spelling
+when naming anything else.
 
-### Resource inventory
+### Resource inventory (Non-Prod — built and verified)
 
-| Resource | Non-Prod name | Prod name | Notes |
-|---|---|---|---|
-| Resource Group | `rg-bff-np-eus` | `rg-bff-prod-eus` | plus `rg-bff-shared-eus` for ACR |
-| Container Registry | `acrbffeus` (in `rg-bff-shared-eus`) | *(same, shared)* | globally unique, no hyphens |
-| Container Apps Environment | `cae-bff-np-eus` | `cae-bff-prod-eus` | |
-| Container App | `ca-bff-np-eus` | `ca-bff-prod-eus` | |
-| Azure Managed Redis (redisenterprise cluster) | `redis-bff-np-eus` | `redis-bff-prod-eus` | `Balanced_B0`, `NoCluster` policy, default database |
-| Key Vault | `kv-bff-np-eus` | `kv-bff-prod-eus` | globally unique, ≤24 chars |
-| Log Analytics Workspace | `law-bff-np-eus` | `law-bff-prod-eus` | |
-| Application Insights | `appi-bff-np-eus` | `appi-bff-prod-eus` | |
-| Managed Identity (runtime) | `id-bff-runtime-np-eus` | `id-bff-runtime-prod-eus` | assigned to the Container App |
-| Managed Identity (GitHub OIDC deploy) | `id-bff-deploy-np-eus` | `id-bff-deploy-prod-eus` | federated to GitHub Actions |
+| Resource | Name | Notes |
+|---|---|---|
+| Resource Group | `rg-colourcon-bbf-np-eus` | Typo preserved intentionally — see above |
+| VNet | `vnet-colorcon-bff-np-eus` | `10.60.0.0/16` |
+| Subnet (Container Apps) | `snet-colorcon-bff-aca-np-eus` | `10.60.0.0/23`, delegated to `Microsoft.App/environments` |
+| Subnet (Private Endpoints) | `snet-colorcon-bff-pe-np-eus` | `10.60.2.0/24` |
+| Container Registry | `acrbffeus` (in `rg-bff-shared-eus`) | **Interim** — old naming, reused until a `colorcon`-named shared RG/ACR exists (issue #2) |
+| Container Apps Environment | `cae-colorcon-bff-np-eus` | Zone-redundant, VNet-integrated, `Consumption` workload profile |
+| Container App | `ca-colorcon-bff-np-eus` | 3 health probes, `minReplicas=0/maxReplicas=1` |
+| Azure Managed Redis | `redis-colorcon-bff-np-eus` | `Balanced_B0`, `NoCluster`, private-only |
+| Key Vault | `kv-colorcon-bff-np-eus` | RBAC mode, private-only |
+| Log Analytics Workspace | `law-colorcon-bff-np-eus` | 30-day retention (platform minimum — see §4.5) |
+| Application Insights | `appi-colorcon-bff-np-eus` | |
+| Managed Identity (runtime) | `id-colorcon-bff-runtime-np-eus` | |
+| Managed Identity (GitHub OIDC deploy) | `id-colorcon-bff-deploy-np-eus` | |
+| Private Endpoint (Key Vault) | `pe-kv-colorcon-bff-np-eus` | group-id `vault` |
+| Private Endpoint (Redis) | `pe-redis-colorcon-bff-np-eus` | group-id `redisEnterprise` |
+| Private DNS zone (Key Vault) | `privatelink.vaultcore.azure.net` | linked to the VNet |
+| Private DNS zone (Redis) | `privatelink.redis.azure.net` | linked to the VNet |
 
-### Tagging standard (apply to every resource)
+Production (`rg-colorcon-bff-prod-eus`, correct spelling) is not built yet — separate future
+work, same pattern.
+
+### Tagging standard (per [issue #1](https://github.com/bsarkarlabs-stack/bff-demo/issues/1) §5)
 
 ```
-project=bff
-environment=np|prod
-managedBy=manual-poc            # switch to "iac" once Bicep/Terraform lands
+client=colorcon
+application=bff
+environment=np|prod|shared
 owner=<team-or-email>
+managedBy=manual
 ```
 
-### Hostnames (PRD §7)
-
-```
-bff-dev.company.com   \
-bff-qa.company.com     >  all resolve to ca-bff-np-eus, env selected by Host header
-bff-uat.company.com   /
-bff-prod.company.com  ->  ca-bff-prod-eus
-```
+**Known gap:** tags were not applied during the build documented here — this needs a
+follow-up pass (tracked in issue #3's validation checklist) before calling the environment
+enterprise-ready.
 
 ---
 
 ## 3. Build order
 
-Later steps depend on earlier ones (Key Vault before Container App, identities before RBAC
-assignments, etc.), so create in this order:
-
 ```
-1. Resource Groups
-2. Managed Identities (runtime + deploy, both environments)
-3. GitHub OIDC federation on the deploy identities
-4. Azure Container Registry (shared) + RBAC for deploy identities
-5. Log Analytics Workspace + Application Insights (per environment)
-6. Key Vault (per environment) + secrets + RBAC for runtime identities
-7. Azure Cache for Redis (per environment) -> access key into Key Vault
-8. Container Apps Environment (per environment), wired to Log Analytics
-9. Container App (per environment), with runtime identity attached
-10. GitHub Actions repo/environment secrets
-11. Validation
+1. Resource Group (already exists: rg-colourcon-bbf-np-eus)
+2. VNet + 2 subnets (Container Apps subnet delegated before use)
+3. Log Analytics + Application Insights
+4. Managed Identities (runtime + deploy)
+5. Key Vault (public first) + secrets + RBAC
+6. Key Vault private endpoint + private DNS zone + VNet link
+7. Azure Managed Redis (public first) + database + access keys
+8. Redis private endpoint + private DNS zone + VNet link
+9. Container Apps Environment (zone-redundant, VNet-integrated)
+10. RBAC on the (interim, shared) ACR for both identities
+11. Container App — created with plain flags first, then probes patched in via YAML
+12. GitHub OIDC federation + Container Apps Contributor for the deploy identity
+13. GitHub Environment + secrets
+14. Validate the private paths actually work end-to-end
+15. Only then: disable public network access on Key Vault and Redis, re-validate
 ```
 
-Steps 2–9 below are written once with `<ENV>` placeholders; run twice (`np`, `prod`) except
-where marked shared.
+Steps 5/6 and 7/8 are interleaved above for narrative clarity, but in practice ran
+concurrently (independent resources) to save wall-clock time — nothing here has a hard
+ordering dependency until step 9 needs the VNet subnet, and step 11 needs everything before
+it.
 
 ---
 
-## 4. Step-by-step (az CLI)
+## 4. Step-by-step (verified `az cli` / `bash`)
 
 ### 4.0 Prerequisites
 
-```powershell
+```bash
 az login
 az account set --subscription "<subscription-id-or-name>"
-$LOCATION = "eastus"
+RG=rg-colourcon-bbf-np-eus
+LOCATION=eastus
 ```
 
-### 4.1 Resource Groups
+### 4.1 VNet + subnets
 
-```powershell
-az group create -n rg-bff-np-eus -l $LOCATION --tags project=bff environment=np
-az group create -n rg-bff-prod-eus -l $LOCATION --tags project=bff environment=prod
-az group create -n rg-bff-shared-eus -l $LOCATION --tags project=bff environment=shared
+```bash
+az network vnet create -g "$RG" -n vnet-colorcon-bff-np-eus -l "$LOCATION" \
+  --address-prefix 10.60.0.0/16 \
+  --subnet-name snet-colorcon-bff-aca-np-eus \
+  --subnet-prefix 10.60.0.0/23
+
+az network vnet subnet create -g "$RG" --vnet-name vnet-colorcon-bff-np-eus \
+  -n snet-colorcon-bff-pe-np-eus \
+  --address-prefix 10.60.2.0/24
 ```
 
-### 4.2 Managed Identities
+**The Container Apps subnet must be delegated before the environment can use it** — this
+was missed on the first attempt and failed with
+`ManagedEnvironmentSubnetDelegationError: The subnet of the environment must be delegated
+to the service 'Microsoft.App/environments'`:
 
-```powershell
-foreach ($ENV in @("np","prod")) {
-  az identity create -g "rg-bff-$ENV-eus" -n "id-bff-runtime-$ENV-eus" -l $LOCATION
-  az identity create -g "rg-bff-$ENV-eus" -n "id-bff-deploy-$ENV-eus" -l $LOCATION
-}
+```bash
+az network vnet subnet update -g "$RG" --vnet-name vnet-colorcon-bff-np-eus \
+  -n snet-colorcon-bff-aca-np-eus \
+  --delegations Microsoft.App/environments
 ```
 
-### 4.3 GitHub OIDC federation (on each deploy identity)
+### 4.2 Log Analytics + Application Insights
 
-The `deploy` job in `ci-cd.yml` always sets `environment: non-production` or
-`environment: production` (PRD §20's reviewer-gating requirement for prod). **Whenever a
-job specifies `environment:`, GitHub Actions changes the OIDC token's `sub` claim to
-`repo:<org>/<repo>:environment:<name>` instead of the ref-based
-`repo:<org>/<repo>:ref:refs/heads/<branch>` claim** — federating against the ref-based
-subject (the more commonly-documented pattern) will fail with
-`AADSTS700213: No matching federated identity record found`, discovered the hard way on
-the first real pipeline run.
+```bash
+az monitor log-analytics workspace create -g "$RG" -n law-colorcon-bff-np-eus -l "$LOCATION"
 
-A second, less-documented wrinkle: as of this GitHub platform version, the `<org>` and
-`<repo>` segments of that subject are **not** the plain names — they include the
-immutable numeric org/repo IDs, e.g. `bsarkarlabs-stack@316735306/bff-demo@1333575135`,
-even with `use_immutable_subject: false`. Don't guess the subject string — fetch the exact
-prefix GitHub will present:
-
-```powershell
-gh api repos/<org>/<repo>/actions/oidc/customization/sub
-# -> {"use_default":true,"use_immutable_subject":false,"sub_claim_prefix":"repo:<org>@<id>/<repo>@<id>"}
+az monitor app-insights component create -g "$RG" -a appi-colorcon-bff-np-eus -l "$LOCATION" \
+  --workspace law-colorcon-bff-np-eus --application-type web
 ```
 
-Repeat per environment, mapping branch → environment (`develop` → np, `master` → prod), per
-PRD §20:
+**Retention defaults to 30 days and that's the platform floor for the standard `PerGB2018`
+SKU** — attempting `--retention-time 14` (the originally-planned Non-Prod value) fails with
+`InvalidParameter: 'RetentionInDays' property doesn't match the SKU limits`. 14 days is only
+reachable on the legacy Free SKU (500MB/day ingestion cap — not viable for a real
+workload). 30 days is the accepted value; the original "14 days for Non-Prod" target in
+issue #1 §20 was written without knowing about this platform limit.
 
-```powershell
-$RG = "rg-bff-np-eus"
-$IDENTITY = "id-bff-deploy-np-eus"
-$SUB_PREFIX = gh api repos/<org>/<repo>/actions/oidc/customization/sub --jq ".sub_claim_prefix"
-$SUBJECT = "$SUB_PREFIX`:environment:non-production"
+### 4.3 Managed identities
 
-az identity federated-credential create `
-  --name "gh-oidc-np-environment" `
-  --identity-name $IDENTITY `
-  --resource-group $RG `
-  --issuer "https://token.actions.githubusercontent.com" `
-  --subject $SUBJECT `
-  --audiences "api://AzureADTokenExchange"
+```bash
+az identity create -g "$RG" -n id-colorcon-bff-runtime-np-eus -l "$LOCATION"
+az identity create -g "$RG" -n id-colorcon-bff-deploy-np-eus -l "$LOCATION"
 ```
 
-For prod, use identity `id-bff-deploy-prod-eus` and subject
-`<sub_claim_prefix>:environment:production`.
+### 4.4 Key Vault (public first) + RBAC + secrets
 
-### 4.4 Container Registry (shared)
+```bash
+az keyvault create -g "$RG" -n kv-colorcon-bff-np-eus -l "$LOCATION" --enable-rbac-authorization true
 
-```powershell
-az acr create -g rg-bff-shared-eus -n acrbffeus --sku Standard --location $LOCATION
+KV_ID=$(az keyvault show -g "$RG" -n kv-colorcon-bff-np-eus --query id -o tsv)
+RUNTIME_PRINCIPAL=$(az identity show -g "$RG" -n id-colorcon-bff-runtime-np-eus --query principalId -o tsv)
+az role assignment create --assignee-object-id "$RUNTIME_PRINCIPAL" --assignee-principal-type ServicePrincipal \
+  --role "Key Vault Secrets User" --scope "$KV_ID"
 
-# non-prod deploy identity: push + pull
-$ACR_ID = az acr show -n acrbffeus --query id -o tsv
-$DEPLOY_NP_PRINCIPAL = az identity show -g rg-bff-np-eus -n id-bff-deploy-np-eus --query principalId -o tsv
-az role assignment create --assignee $DEPLOY_NP_PRINCIPAL --role AcrPush --scope $ACR_ID
-
-# prod deploy identity: pull only (prod promotes an image already pushed by non-prod's pipeline)
-$DEPLOY_PROD_PRINCIPAL = az identity show -g rg-bff-prod-eus -n id-bff-deploy-prod-eus --query principalId -o tsv
-az role assignment create --assignee $DEPLOY_PROD_PRINCIPAL --role AcrPull --scope $ACR_ID
-
-# both runtime identities: pull only (Container Apps pulls the image at revision creation)
-foreach ($ENV in @("np","prod")) {
-  $P = az identity show -g "rg-bff-$ENV-eus" -n "id-bff-runtime-$ENV-eus" --query principalId -o tsv
-  az role assignment create --assignee $P --role AcrPull --scope $ACR_ID
-}
+# your own account needs write access too, to set secrets below
+SELF_ID=$(az ad signed-in-user show --query id -o tsv)
+az role assignment create --assignee-object-id "$SELF_ID" --assignee-principal-type User \
+  --role "Key Vault Secrets Officer" --scope "$KV_ID"
 ```
 
-### 4.5 Log Analytics + Application Insights
+RBAC on Key Vault's data plane can lag by ~20s after the role assignment — wait briefly
+before setting secrets or you'll see a transient `Forbidden`:
 
-```powershell
-foreach ($ENV in @("np","prod")) {
-  $RG = "rg-bff-$ENV-eus"
-  az monitor log-analytics workspace create -g $RG -n "law-bff-$ENV-eus" -l $LOCATION
-  az monitor app-insights component create -g $RG -a "appi-bff-$ENV-eus" -l $LOCATION `
-    --workspace "law-bff-$ENV-eus" --application-type web
-}
+```bash
+sleep 20
+az keyvault secret set --vault-name kv-colorcon-bff-np-eus --name oauth-client-id --value "<client-id>"
+az keyvault secret set --vault-name kv-colorcon-bff-np-eus --name oauth-client-secret --value "<client-secret>"
 ```
 
-### 4.6 Key Vault + RBAC
+### 4.5 Key Vault private endpoint + private DNS
 
-```powershell
-foreach ($ENV in @("np","prod")) {
-  $RG = "rg-bff-$ENV-eus"
-  az keyvault create -g $RG -n "kv-bff-$ENV-eus" -l $LOCATION --enable-rbac-authorization true
+```bash
+az network private-dns zone create -g "$RG" -n privatelink.vaultcore.azure.net
 
-  $KV_ID = az keyvault show -g $RG -n "kv-bff-$ENV-eus" --query id -o tsv
-  $RUNTIME_PRINCIPAL = az identity show -g $RG -n "id-bff-runtime-$ENV-eus" --query principalId -o tsv
-  az role assignment create --assignee $RUNTIME_PRINCIPAL --role "Key Vault Secrets User" --scope $KV_ID
-}
+az network private-dns link vnet create -g "$RG" \
+  -n dnslink-kv-colorcon-bff-np-eus \
+  -z privatelink.vaultcore.azure.net \
+  -v vnet-colorcon-bff-np-eus \
+  --registration-enabled false
+
+KV_ID=$(az keyvault show -g "$RG" -n kv-colorcon-bff-np-eus --query id -o tsv)
+
+az network private-endpoint create -g "$RG" \
+  -n pe-kv-colorcon-bff-np-eus \
+  --vnet-name vnet-colorcon-bff-np-eus \
+  --subnet snet-colorcon-bff-pe-np-eus \
+  --private-connection-resource-id "$KV_ID" \
+  --group-id vault \
+  --connection-name pe-conn-kv-colorcon-bff-np-eus
+
+az network private-endpoint dns-zone-group create -g "$RG" \
+  --endpoint-name pe-kv-colorcon-bff-np-eus \
+  -n default \
+  --private-dns-zone privatelink.vaultcore.azure.net \
+  --zone-name vaultcore
 ```
 
-Populate the OAuth secrets (values come from whoever owns the OAuth provider registration
-— never hardcode them in a script that gets committed):
+Don't disable public access yet — that happens in §4.11, only after the Container App
+exists and the private path is validated end-to-end.
 
-```powershell
-az keyvault secret set --vault-name kv-bff-np-eus --name oauth-client-id --value "<client-id>"
-az keyvault secret set --vault-name kv-bff-np-eus --name oauth-client-secret --value "<client-secret>"
+### 4.6 Azure Managed Redis (public first)
+
+```bash
+az redisenterprise create --cluster-name redis-colorcon-bff-np-eus -g "$RG" -l "$LOCATION" \
+  --sku Balanced_B0 --minimum-tls-version "1.2" --public-network-access Enabled
 ```
 
-### 4.7 Azure Managed Redis
+**Whether this alone provisions a usable default database is inconsistent** — in one run it
+silently created nothing (`az redisenterprise database list` came back empty); in another
+run it auto-created one with the wrong clustering policy (`OSSCluster` instead of
+`NoCluster`). Either way, don't trust the auto-created database — check explicitly and fix
+it:
 
-Uses the `redisenterprise` extension (auto-installs on first use) rather than the classic
-`az redis create` — see §1's design decision on why. `--clustering-policy NoCluster` keeps
-the wire protocol compatible with the app's plain `redis-py` client (no cluster-aware
-client needed for a single key per request, which is all this app does).
-
-```powershell
-foreach ($ENV in @("np","prod")) {
-  $RG = "rg-bff-$ENV-eus"
-
-  # 1. Cluster (this alone does NOT reliably provision the default database — create it explicitly next)
-  az redisenterprise create --cluster-name "redis-bff-$ENV-eus" -g $RG -l $LOCATION `
-    --sku Balanced_B0 --minimum-tls-version "1.2" --public-network-access Enabled
-
-  # 2. Database — note: this CLI extension takes no --database-name flag; there is exactly
-  #    one database per cluster and it's implicitly named "default"
-  az redisenterprise database create -g $RG --cluster-name "redis-bff-$ENV-eus" `
-    --clustering-policy NoCluster --client-protocol Encrypted --eviction-policy VolatileLRU
-
-  # 3. Access keys default to Disabled as of this CLI version — enable explicitly, since the
-  #    app authenticates with a key (§1 design decision), not Entra ID
-  az redisenterprise database update -g $RG --cluster-name "redis-bff-$ENV-eus" `
-    --access-keys-authentication Enabled
-
-  $HOST = az redisenterprise show -g $RG --cluster-name "redis-bff-$ENV-eus" --query hostName -o tsv
-  $PORT = az redisenterprise database show -g $RG --cluster-name "redis-bff-$ENV-eus" --query port -o tsv
-  $KEY = az redisenterprise database list-keys -g $RG --cluster-name "redis-bff-$ENV-eus" --query primaryKey -o tsv
-
-  az keyvault secret set --vault-name "kv-bff-$ENV-eus" --name redis-access-key --value $KEY
-  Write-Output "redis-bff-$ENV-eus -> $HOST`:$PORT"
-}
+```bash
+az redisenterprise database list -g "$RG" --cluster-name redis-colorcon-bff-np-eus -o json
 ```
 
-`Balanced_B0` is the smallest Managed Redis SKU — a reasonable POC size, still undersized
-for prod concurrency. Revisit tier/size once real load numbers exist (PRD §21 sizing note).
-Unlike classic Azure Cache for Redis, the port is dynamically assigned per database (not a
-fixed 6380) — capture it from `az redisenterprise database show` rather than hardcoding it,
-and set `REDIS_PORT` on the Container App accordingly (§4.9). The app also needs the key
-itself as `REDIS_PASSWORD` (via `secretref:redis-key`, §4.9) — Managed Redis requires
-authentication on connect, unlike a bare local Redis container.
+If empty, create it explicitly. **Note: this CLI extension takes no `--database-name`
+flag** — there's exactly one database per cluster, implicitly named `default`:
 
-### 4.8 Container Apps Environment
-
-```powershell
-foreach ($ENV in @("np","prod")) {
-  $RG = "rg-bff-$ENV-eus"
-  $LAW_ID = az monitor log-analytics workspace show -g $RG -n "law-bff-$ENV-eus" --query customerId -o tsv
-  $LAW_KEY = az monitor log-analytics workspace get-shared-keys -g $RG -n "law-bff-$ENV-eus" --query primarySharedKey -o tsv
-
-  az containerapp env create -g $RG -n "cae-bff-$ENV-eus" -l $LOCATION `
-    --logs-workspace-id $LAW_ID --logs-workspace-key $LAW_KEY
-}
+```bash
+az redisenterprise database create -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
+  --clustering-policy NoCluster --client-protocol Encrypted --eviction-policy VolatileLRU
 ```
 
-### 4.9 Container App
+If one already exists with the wrong clustering policy, **it can't be changed in place** —
+`az redisenterprise database create` on an existing database returns
+`BadRequest: 'properties.clusteringPolicy' cannot be changed... You must create a new
+database`. Delete and recreate:
 
-```powershell
-$ENV = "np"; $RG = "rg-bff-np-eus"
-$RUNTIME_ID = az identity show -g $RG -n "id-bff-runtime-$ENV-eus" --query id -o tsv
-$RUNTIME_CLIENT_ID = az identity show -g $RG -n "id-bff-runtime-$ENV-eus" --query clientId -o tsv
-$APPI_CONN = az monitor app-insights component show -g $RG -a "appi-bff-$ENV-eus" --query connectionString -o tsv
-$REDIS_KEY = az keyvault secret show --vault-name "kv-bff-$ENV-eus" --name redis-access-key --query value -o tsv
-$REDIS_HOST = az redisenterprise show -g $RG --cluster-name "redis-bff-$ENV-eus" --query hostName -o tsv
-$REDIS_PORT = az redisenterprise database show -g $RG --cluster-name "redis-bff-$ENV-eus" --query port -o tsv
+```bash
+az redisenterprise database delete -g "$RG" --cluster-name redis-colorcon-bff-np-eus --yes
+az redisenterprise database create -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
+  --clustering-policy NoCluster --client-protocol Encrypted --eviction-policy VolatileLRU
+```
 
-az containerapp create -g $RG -n "ca-bff-$ENV-eus" `
-  --environment "cae-bff-$ENV-eus" `
-  --image "acrbffeus.azurecr.io/bff-auth:bootstrap" `
-  --registry-server acrbffeus.azurecr.io `
-  --registry-identity $RUNTIME_ID `
-  --user-assigned $RUNTIME_ID `
-  --target-port 8000 --ingress external `
-  --min-replicas 1 --max-replicas 3 `
-  --cpu 0.5 --memory 1Gi `
-  --secrets "redis-key=$REDIS_KEY" `
-  --env-vars `
-    "ENVIRONMENT=dev" `
-    "REDIS_HOST=$REDIS_HOST" `
-    "REDIS_PORT=$REDIS_PORT" `
-    "REDIS_SSL=true" `
-    "REDIS_PASSWORD=secretref:redis-key" `
-    "KEY_VAULT_URL=https://kv-bff-$ENV-eus.vault.azure.net/" `
-    "AZURE_CLIENT_ID=$RUNTIME_CLIENT_ID" `
+**Access-key authentication defaults to `Disabled`** as of this CLI version (ahead of a
+scheduled breaking-change release) — enable it explicitly, since the app authenticates with
+a key via Key Vault, not Entra ID:
+
+```bash
+az redisenterprise database update -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
+  --access-keys-authentication Enabled
+```
+
+### 4.7 Redis private endpoint + private DNS
+
+The generic `az network private-link-resource list --type` command's client-side type
+validation doesn't include `Microsoft.Cache/redisEnterprise` in this CLI version — that's
+just an outdated allowlist in the command itself, not a sign private endpoints aren't
+supported. Skip that check and create the endpoint directly with the documented group ID
+(`redisEnterprise`), which works:
+
+```bash
+REDIS_ID=$(az redisenterprise show -g "$RG" --cluster-name redis-colorcon-bff-np-eus --query id -o tsv)
+
+az network private-dns zone create -g "$RG" -n privatelink.redis.azure.net
+
+az network private-dns link vnet create -g "$RG" \
+  -n dnslink-redis-colorcon-bff-np-eus \
+  -z privatelink.redis.azure.net \
+  -v vnet-colorcon-bff-np-eus \
+  --registration-enabled false
+
+az network private-endpoint create -g "$RG" \
+  -n pe-redis-colorcon-bff-np-eus \
+  --vnet-name vnet-colorcon-bff-np-eus \
+  --subnet snet-colorcon-bff-pe-np-eus \
+  --private-connection-resource-id "$REDIS_ID" \
+  --group-id redisEnterprise \
+  --connection-name pe-conn-redis-colorcon-bff-np-eus
+
+az network private-endpoint dns-zone-group create -g "$RG" \
+  --endpoint-name pe-redis-colorcon-bff-np-eus \
+  -n default \
+  --private-dns-zone privatelink.redis.azure.net \
+  --zone-name redis
+```
+
+To *prove* the private path is wired correctly before relying on it, check the DNS record's
+actual IP is inside the private endpoint subnet's range (`10.60.2.0/24`), rather than just
+assuming the zone-group creation worked:
+
+```bash
+az network private-dns record-set a show -g "$RG" -z privatelink.vaultcore.azure.net -n kv-colorcon-bff-np-eus --query aRecords -o json
+az network private-dns record-set a show -g "$RG" -z privatelink.redis.azure.net -n redis-colorcon-bff-np-eus.eastus --query aRecords -o json
+# both returned 10.60.2.x addresses, confirming correct wiring
+```
+
+### 4.8 Container Apps Environment (zone-redundant, VNet-integrated)
+
+```bash
+SUBNET_ID=$(az network vnet subnet show -g "$RG" --vnet-name vnet-colorcon-bff-np-eus -n snet-colorcon-bff-aca-np-eus --query id -o tsv)
+LAW_ID=$(az monitor log-analytics workspace show -g "$RG" -n law-colorcon-bff-np-eus --query customerId -o tsv)
+LAW_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n law-colorcon-bff-np-eus --query primarySharedKey -o tsv)
+
+az containerapp env create -g "$RG" -n cae-colorcon-bff-np-eus -l "$LOCATION" \
+  --logs-workspace-id "$LAW_ID" --logs-workspace-key "$LAW_KEY" \
+  --infrastructure-subnet-resource-id "$SUBNET_ID" \
+  --zone-redundant
+```
+
+`--zone-redundant` requires `--infrastructure-subnet-resource-id` — omitting it errors
+immediately. Zone redundancy is fully supported on the default `Consumption` workload
+profile (confirmed against Microsoft's reliability docs — no need to switch to a Dedicated
+workload profile), provided the infrastructure subnet is `/23` or larger, which
+`snet-colorcon-bff-aca-np-eus` already is.
+
+### 4.9 RBAC on the shared ACR (interim `acrbffeus`)
+
+```bash
+ACR_ID=$(az acr show -n acrbffeus --query id -o tsv)
+RUNTIME_PRINCIPAL=$(az identity show -g "$RG" -n id-colorcon-bff-runtime-np-eus --query principalId -o tsv)
+DEPLOY_PRINCIPAL=$(az identity show -g "$RG" -n id-colorcon-bff-deploy-np-eus --query principalId -o tsv)
+
+az role assignment create --assignee-object-id "$RUNTIME_PRINCIPAL" --assignee-principal-type ServicePrincipal \
+  --role AcrPull --scope "$ACR_ID"
+az role assignment create --assignee-object-id "$DEPLOY_PRINCIPAL" --assignee-principal-type ServicePrincipal \
+  --role AcrPush --scope "$ACR_ID"
+```
+
+### 4.10 Container App — create first, patch in probes
+
+`az containerapp create` has no flags for custom health probes — they only exist in the
+YAML schema. Rather than hand-write that YAML from memory (the first attempt failed with an
+opaque `The JSON value could not be converted to System.Boolean` schema error), create the
+app first with plain flags — proven to work — then export its *real* YAML as ground truth
+and patch probes into that.
+
+```bash
+RUNTIME_ID=$(az identity show -g "$RG" -n id-colorcon-bff-runtime-np-eus --query id -o tsv)
+RUNTIME_CLIENT_ID=$(az identity show -g "$RG" -n id-colorcon-bff-runtime-np-eus --query clientId -o tsv)
+REDIS_HOST=$(az redisenterprise show -g "$RG" --cluster-name redis-colorcon-bff-np-eus --query hostName -o tsv)
+REDIS_PORT=$(az redisenterprise database show -g "$RG" --cluster-name redis-colorcon-bff-np-eus --query port -o tsv)
+REDIS_KEY=$(az redisenterprise database list-keys -g "$RG" --cluster-name redis-colorcon-bff-np-eus --query primaryKey -o tsv)
+APPI_CONN=$(az monitor app-insights component show -g "$RG" -a appi-colorcon-bff-np-eus --query connectionString -o tsv)
+
+az containerapp create -g "$RG" -n ca-colorcon-bff-np-eus \
+  --environment cae-colorcon-bff-np-eus \
+  --image acrbffeus.azurecr.io/bff-auth:<git-sha> \
+  --registry-server acrbffeus.azurecr.io \
+  --registry-identity "$RUNTIME_ID" \
+  --user-assigned "$RUNTIME_ID" \
+  --target-port 8000 --ingress external \
+  --min-replicas 0 --max-replicas 1 \
+  --cpu 0.5 --memory 1Gi \
+  --secrets "redis-key=$REDIS_KEY" \
+  --env-vars \
+    "ENVIRONMENT=non-production" \
+    "REDIS_HOST=$REDIS_HOST" \
+    "REDIS_PORT=$REDIS_PORT" \
+    "REDIS_SSL=true" \
+    "REDIS_PASSWORD=secretref:redis-key" \
+    "KEY_VAULT_URL=https://kv-colorcon-bff-np-eus.vault.azure.net/" \
+    "AZURE_CLIENT_ID=$RUNTIME_CLIENT_ID" \
     "APPLICATIONINSIGHTS_CONNECTION_STRING=$APPI_CONN"
 ```
 
-Note: `az redisenterprise database show`/`create` in the current CLI extension take no `--database-name`
-flag — the database name is implicit (there's exactly one per cluster, named `default`).
-Also note the Managed Redis database defaults to `accessKeysAuthentication: Disabled` as of
-this CLI version — enable it explicitly right after creating the database:
-`az redisenterprise database update -g $RG --cluster-name "redis-bff-$ENV-eus" --access-keys-authentication Enabled`.
+`minReplicas=0/maxReplicas=1` was an explicit cost call for Non-Prod — note the zone
+redundancy caveat in §1. `ENVIRONMENT=non-production` (not the original PRD's `dev`)
+reflects the shared 7-branch Non-Prod platform this environment actually is — see
+ARCHITECTURE_CONCEPTS.md §12 for the fuller reasoning, and the still-open question there
+about eventually moving to a `PLATFORM_ENVIRONMENT` + hostname-routing scheme.
 
-Notes:
-- `--image ...:bootstrap` is a placeholder — the real image tag lands via the GitHub Actions
-  deploy job (`az containerapp update --image ...:<git-sha>`), never `latest` (PRD §11).
-- `AZURE_CLIENT_ID` tells `DefaultAzureCredential` which user-assigned identity to use, since
-  the app has more than one identity available at the environment level once both runtime
-  and deploy identities exist in the same resource group.
-- `REDIS_PORT` is pulled dynamically (Managed Redis assigns it per database, unlike classic
-  Azure Cache for Redis's fixed 6380) and `REDIS_SSL=true` since the client protocol was
-  created as `Encrypted` (§4.7) — the app's `config.py` already exposes both as settings, so
-  no code change needed.
-- Repeat for `prod`, pointed at `rg-bff-prod-eus` resources, and drop `bootstrap`/`dev`
-  accordingly once the pipeline exists.
+Now export the real YAML and patch in the three probes (Startup only checks the app is up;
+Liveness deliberately checks nothing external — see ARCHITECTURE_CONCEPTS.md §13 for why
+mixing in Redis/Key Vault checks there would turn a transient dependency blip into an
+unnecessary container restart):
 
-**The deploy identity still can't deploy yet.** §4.4 only granted it `AcrPush`/`AcrPull` —
-it has no permission to touch the Container App itself. Without this, `az containerapp
-update` in the pipeline fails with `ERROR: The containerapp '***' does not exist` — Azure
-Resource Manager returns a 404-shaped error for RBAC-denied reads rather than a 403, so the
-failure reads like a naming/scope bug instead of a permissions one. Grant it scoped to just
-this app (least privilege — not the whole resource group):
-
-```powershell
-$CA_ID = az containerapp show -g $RG -n "ca-bff-$ENV-eus" --query id -o tsv
-$DEPLOY_PRINCIPAL = az identity show -g $RG -n "id-bff-deploy-$ENV-eus" --query principalId -o tsv
-az role assignment create --assignee-object-id $DEPLOY_PRINCIPAL --assignee-principal-type ServicePrincipal `
-  --role "Container Apps Contributor" --scope $CA_ID
+```bash
+az containerapp show -g "$RG" -n ca-colorcon-bff-np-eus -o yaml > /tmp/ca-update.yaml
+# Edit /tmp/ca-update.yaml in place: add a `probes:` list under
+# properties.template.containers[0], alongside the existing fields (env, image, name,
+# resources). Trim read-only/computed top-level fields first — id, systemData,
+# provisioningState, outboundIpAddresses, eventStreamEndpoint, customDomainVerificationId,
+# latestRevisionName/Fqdn — the update call can reject an unedited full export.
 ```
 
-Domain binding (custom hostnames from PRD §7) is a separate, one-time step per environment
-via `az containerapp hostname add` + `az containerapp hostname bind`, done once DNS/TLS
-cert ownership is sorted — not blocking for POC (Container Apps' default
-`*.azurecontainerapps.io` URL is enough to validate the checklist in PRD §31).
+The probes block that worked:
 
-### 4.10 GitHub repo/environment secrets
-
-Create the GitHub **Environments** first (their names must exactly match the `environment:`
-values the workflow computes — `non-production` and `production`), then set secrets scoped
-to each one, so a `master` deploy can never see non-prod's identity or vice versa:
-
-```powershell
-gh api --method PUT repos/<org>/<repo>/environments/non-production
+```yaml
+probes:
+- type: Startup
+  httpGet:
+    path: /health/startup
+    port: 8000
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  failureThreshold: 10
+- type: Liveness
+  httpGet:
+    path: /health/live
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+- type: Readiness
+  httpGet:
+    path: /health/ready
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
 ```
 
-| Secret | Non-Prod value | Prod value |
-|---|---|---|
-| `AZURE_CLIENT_ID` | `id-bff-deploy-np-eus` client ID | `id-bff-deploy-prod-eus` client ID |
-| `AZURE_TENANT_ID` | tenant ID (same both envs) | same |
-| `AZURE_SUBSCRIPTION_ID` | subscription ID | same |
-| `ACR_NAME` | `acrbffeus` | `acrbffeus` |
-| `RESOURCE_GROUP` | `rg-bff-np-eus` | `rg-bff-prod-eus` |
-| `CONTAINER_APP_NAME` | `ca-bff-np-eus` | `ca-bff-prod-eus` |
-| `CONTAINER_APP_URL` | its `*.azurecontainerapps.io` FQDN | its FQDN |
+Apply it and verify the probes actually landed — don't trust a clean exit code alone:
 
-These map directly onto the secrets already referenced in
-[.github/workflows/ci-cd.yml](.github/workflows/ci-cd.yml). `master` deploys to production
-(PRD §20's reviewer-gating requirement — enforce with required reviewers on the
-`production` Environment); the repo's default branch here is `master`, not `main`.
+```bash
+az containerapp update -g "$RG" -n ca-colorcon-bff-np-eus --yaml /tmp/ca-update.yaml
 
-**Use `printf`, not `echo`, when piping values into `gh secret set`.** `echo "$VALUE" | gh
-secret set NAME` stores the trailing newline `echo` appends as part of the secret — e.g.
-`CONTAINER_APP_NAME` becomes `"ca-bff-np-eus\n"`. Every downstream `az` command lookup
-then fails with a not-found-shaped error even though the resource obviously exists, which
-reads like an RBAC or naming bug, not a whitespace one:
-
-```powershell
-printf '%s' "ca-bff-np-eus" | gh secret set CONTAINER_APP_NAME --env non-production --repo <org>/<repo>
+az containerapp show -g "$RG" -n ca-colorcon-bff-np-eus \
+  --query "properties.template.containers[0].probes" -o json
 ```
 
-### 4.11 CI/CD workflow gotchas hit on the first real run
+`/health/startup` is a new endpoint (`app/main.py`) added specifically for this — it didn't
+exist before this build, since the original 2-probe (`/health`, `/health/live`,
+`/health/ready`) design had no dedicated startup check.
 
-- `aquasecurity/trivy-action` tags are `v`-prefixed (`v0.36.0`, not `0.36.0`) — an unprefixed
-  pin fails at `Unable to resolve action` before the job even starts.
-- Trivy will find real CVEs in the Debian base image with **no fix published yet**
-  (`Fixed Version` blank in its table). Gating `exit-code: 1` on those permanently blocks
-  CI. Set `ignore-unfixed: true` so the scan only fails on vulnerabilities that are
-  actually fixable — then fix the ones it does report (here: bumping `fastapi` to pull a
-  patched `starlette`, since `fastapi==0.115.0` pinned `starlette<0.39.0`, which had known
-  CVEs).
+### 4.11 GitHub OIDC federation + Container Apps RBAC for the deploy identity
+
+Same subject-format rules as CICD_SETUP.md §3 — fetch the real prefix, don't guess it:
+
+```bash
+SUB_PREFIX=$(gh api repos/bsarkarlabs-stack/bff-demo/actions/oidc/customization/sub --jq ".sub_claim_prefix")
+
+az identity federated-credential create \
+  --name gh-oidc-np-environment \
+  --identity-name id-colorcon-bff-deploy-np-eus \
+  --resource-group "$RG" \
+  --issuer https://token.actions.githubusercontent.com \
+  --subject "${SUB_PREFIX}:environment:non-production" \
+  --audiences api://AzureADTokenExchange
+```
+
+The deploy identity also needs `Container Apps Contributor` scoped to the app itself —
+without this, the pipeline's `az containerapp update` fails with a 404-shaped "does not
+exist" error that masks the real RBAC cause (see CICD_SETUP.md §4.2 for the full
+explanation):
+
+```bash
+CA_ID=$(az containerapp show -g "$RG" -n ca-colorcon-bff-np-eus --query id -o tsv)
+DEPLOY_PRINCIPAL=$(az identity show -g "$RG" -n id-colorcon-bff-deploy-np-eus --query principalId -o tsv)
+
+az role assignment create --assignee-object-id "$DEPLOY_PRINCIPAL" --assignee-principal-type ServicePrincipal \
+  --role "Container Apps Contributor" --scope "$CA_ID"
+```
+
+### 4.12 GitHub secrets
+
+Update the existing `non-production` GitHub Environment's secrets to point at the new
+resources. **Use `printf`, not `echo`** — see CICD_SETUP.md §5 for why `echo | gh secret
+set` silently corrupts the value with a trailing newline:
+
+```bash
+REPO=bsarkarlabs-stack/bff-demo
+
+CLIENT_ID=$(az identity show -g "$RG" -n id-colorcon-bff-deploy-np-eus --query clientId -o tsv)
+TENANT_ID=$(az account show --query tenantId -o tsv)
+SUB_ID=$(az account show --query id -o tsv)
+
+printf '%s' "$CLIENT_ID" | gh secret set AZURE_CLIENT_ID --env non-production --repo "$REPO"
+printf '%s' "$TENANT_ID" | gh secret set AZURE_TENANT_ID --env non-production --repo "$REPO"
+printf '%s' "$SUB_ID" | gh secret set AZURE_SUBSCRIPTION_ID --env non-production --repo "$REPO"
+printf '%s' "acrbffeus" | gh secret set ACR_NAME --env non-production --repo "$REPO"
+printf '%s' "$RG" | gh secret set RESOURCE_GROUP --env non-production --repo "$REPO"
+printf '%s' "ca-colorcon-bff-np-eus" | gh secret set CONTAINER_APP_NAME --env non-production --repo "$REPO"
+printf '%s' "https://<container-app-fqdn>" | gh secret set CONTAINER_APP_URL --env non-production --repo "$REPO"
+```
+
+### 4.13 Validate the private paths, then lock down public access
+
+**Don't disable public access first and hope** — validate the private path actually works
+while public access is still available as a fallback, per the hardening order in
+ARCHITECTURE_CONCEPTS.md §9. Two ways to validate, both used here:
+
+1. Confirm the private DNS A records resolve to addresses inside the private endpoint
+   subnet (done in §4.7 above — `10.60.2.4` for Key Vault, `10.60.2.5` for Redis).
+2. The definitive test: disable public access, then confirm the app still works.
+
+```bash
+az keyvault update -g "$RG" -n kv-colorcon-bff-np-eus --public-network-access Disabled
+```
+
+```bash
+curl https://<container-app-fqdn>/token
+# 502 "Failed to obtain token" is EXPECTED here (placeholder OAuth credentials) — what
+# matters is that the failure trace (az containerapp logs show) proves it got past the
+# Key Vault read via httpx.UnsupportedProtocol on the empty OAUTH_TOKEN_URL, not a Key
+# Vault connection/auth error. That's proof the private path works.
+```
+
+```bash
+az redisenterprise update -g "$RG" --cluster-name redis-colorcon-bff-np-eus --public-network-access Disabled
+curl https://<container-app-fqdn>/health/ready
+# 200 {"status":"ready"} confirms Redis over the private endpoint only
+```
+
+Note: control-plane operations (`az keyvault update`, `az redisenterprise update`) go
+through ARM and are **not** blocked by the resource's own network rules — disabling public
+data-plane access doesn't lock you out of managing the resource via `az cli`, only out of
+reading/writing secrets or cache data from outside the VNet.
+
+### 4.14 Housekeeping: orphaned RBAC after a resource group deletion
+
+If a resource group holding identities that had RBAC grants elsewhere gets deleted (as
+happened here — an earlier `rg-bff-np-eus` was deleted mid-project), the role assignments
+on resources *outside* that group (the shared ACR) don't get cleaned up automatically —
+they become orphaned, showing a blank `principalName` since the principal no longer
+resolves:
+
+```bash
+ACR_ID=$(az acr show -n acrbffeus --query id -o tsv)
+az role assignment list --scope "$ACR_ID" -o json
+# entries with empty principalName are orphaned; cross-check principalId against
+# currently-existing identities before deleting anything
+az role assignment delete --ids "<orphaned-assignment-id>" "<another-orphaned-id>"
+```
 
 ---
 
 ## 5. Validation checklist
 
-Mirrors PRD §31, scoped to what's newly testable once the above exists:
+See [issue #3](https://github.com/bsarkarlabs-stack/bff-demo/issues/3) for the full,
+currently-in-progress checklist — cross-environment isolation, pipeline end-to-end trigger,
+tag audit, and zone-redundancy sanity checks are still open.
 
-- [ ] `az acr login` + manual `docker push` of a test tag succeeds using the deploy identity's
-      federated OIDC token (i.e., run the GitHub Actions build job once by hand-triggering).
-- [ ] Container App revision comes up healthy after `az containerapp update --image ...`.
-- [ ] Runtime identity can read `oauth-client-id` / `oauth-client-secret` / `redis-access-key`
-      from its own Key Vault only (confirm it gets `Forbidden` against the *other*
-      environment's Key Vault — proves isolation).
-- [ ] `/health/ready` returns 200 against the real `redis-bff-np-eus.redis.cache.windows.net`.
-- [ ] `/token` returns a real access token end-to-end (Key Vault → OAuth provider → Redis
-      cache write), and a second call is a cache hit (check Application Insights / logs for
-      `Redis cache HIT`).
-- [ ] No secret value appears in Log Analytics / App Insights logs.
-- [ ] Non-prod's deploy identity **cannot** push to anything scoped to `rg-bff-prod-eus`
-      (RBAC scoped correctly).
+Already confirmed in this build:
+
+- [x] `/health`, `/health/startup`, `/health/live`, `/health/ready` all return 200
+- [x] All 3 probes verified present on the live resource (not just assumed from a clean
+      `update` exit code)
+- [x] `/token` reaches Key Vault successfully via the runtime managed identity, over the
+      private endpoint only (public access disabled), failing only at the placeholder
+      OAuth call
+- [x] `/health/ready` returns 200 against Redis over the private endpoint only (public
+      access disabled)
+- [x] No secrets appear in any log line across every failure trace inspected
 
 ---
 
-## 6. Explicitly out of scope for this POC (PRD §27–28)
+## 6. Explicitly deferred
 
-Deferred, not forgotten — none of the naming or resource shape above needs to change when
-these land:
-
-- VNet integration + Private Endpoints for Key Vault/Redis/ACR.
-- Azure Front Door or API Management in front of Container Apps.
-- IP allow-listing / restricted ingress.
-- Terraform/Bicep translation of section 4 (this doc *is* the spec to translate from).
-- Production alerting (5xx rate, latency, Redis unavailability, restart spikes — PRD §25).
+- Shared `colorcon`-named RG/ACR (`rg-colorcon-bff-shared-eus` / `acrcolorconbffeus`) — the
+  interim `acrbffeus` is still in use; migrate once the new shared RG exists.
+- Production environment — same pattern, not started.
+- Custom domain / DNS / TLS, production alerting, production HA sizing, full CI/CD policy
+  review — all tracked as deferred-with-a-reason in
+  [issue #1](https://github.com/bsarkarlabs-stack/bff-demo/issues/1), not overlooked.
+- Tag application (`client`, `application`, `environment`, `owner`, `managedBy`) across all
+  resources built in this session — tracked in
+  [issue #3](https://github.com/bsarkarlabs-stack/bff-demo/issues/3).
