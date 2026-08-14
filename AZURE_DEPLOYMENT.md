@@ -1,16 +1,18 @@
 # Azure Deployment Plan — BFF Auth Service
 
 Every command in this document has actually been run against a real Azure subscription and
-verified working, in this exact order, for the Non-Prod environment. Where the first
-attempt failed, the failure and fix are documented inline rather than smoothed over —
-that's what made this a reliable runbook instead of a guess.
+verified working, for the Non-Prod environment. Section 4 is a clean execution runbook —
+only the commands that actually worked, one step at a time, each with its own purpose,
+verification, and go/no-go decision. Every failed attempt that happened along the way is
+preserved in Section 6, not hidden — that's where the "why" behind some of Section 4's
+steps comes from.
 
 This supersedes the original POC-shaped plan: Non-Prod is now built to the same
 architectural spec as Production (private networking, zone redundancy), just sized down
 for cost — see [ARCHITECTURE_CONCEPTS.md](ARCHITECTURE_CONCEPTS.md) §3.3 for why, and
 [issue #1](https://github.com/bsarkarlabs-stack/bff-demo/issues/1) for the full target
 architecture this executes. All commands are `bash`, run via `az cli` (WSL Ubuntu in this
-session) — not PowerShell; every command here was actually executed this way.
+session) — not PowerShell.
 
 Read [TESTING.md](TESTING.md) first — this plan assumes the image already builds, runs,
 and passes health checks locally.
@@ -56,7 +58,7 @@ when naming anything else.
 | Container App | `ca-colorcon-bff-np-eus` | 3 health probes, `minReplicas=0/maxReplicas=1` |
 | Azure Managed Redis | `redis-colorcon-bff-np-eus` | `Balanced_B0`, `NoCluster`, private-only |
 | Key Vault | `kv-colorcon-bff-np-eus` | RBAC mode, private-only |
-| Log Analytics Workspace | `law-colorcon-bff-np-eus` | 30-day retention (platform minimum — see §4.5) |
+| Log Analytics Workspace | `law-colorcon-bff-np-eus` | 30-day retention (platform minimum — see Step 5) |
 | Application Insights | `appi-colorcon-bff-np-eus` | |
 | Managed Identity (runtime) | `id-colorcon-bff-runtime-np-eus` | |
 | Managed Identity (GitHub OIDC deploy) | `id-colorcon-bff-deploy-np-eus` | |
@@ -78,9 +80,9 @@ owner=<team-or-email>
 managedBy=manual
 ```
 
-**Known gap:** tags were not applied during the build documented here — this needs a
-follow-up pass (tracked in issue #3's validation checklist) before calling the environment
-enterprise-ready.
+**Known gap:** tags were not applied during the build documented here — see
+[issue #3](https://github.com/bsarkarlabs-stack/bff-demo/issues/3), listed under §7
+Optional/Deferred below.
 
 ---
 
@@ -104,26 +106,73 @@ enterprise-ready.
 15. Only then: disable public network access on Key Vault and Redis, re-validate
 ```
 
-Steps 5/6 and 7/8 are interleaved above for narrative clarity, but in practice ran
-concurrently (independent resources) to save wall-clock time — nothing here has a hard
-ordering dependency until step 9 needs the VNet subnet, and step 11 needs everything before
-it.
-
 ---
 
-## 4. Step-by-step (verified `az cli` / `bash`)
+## 4. Execution runbook
 
-### 4.0 Prerequisites
+Each step is: **Purpose** (why it exists) → **Run** (the exact command) → **Verify** (how
+to confirm it actually worked, not just that the CLI returned exit 0) → **Expected
+result** → **Next** (explicit go/no-go). Steps that already exist are marked so you don't
+recreate them blindly.
 
 ```bash
-az login
-az account set --subscription "<subscription-id-or-name>"
+# shared across every step below
 RG=rg-colourcon-bbf-np-eus
 LOCATION=eastus
 ```
 
-### 4.1 VNet + subnets
+---
 
+### Step 1 — Prerequisites
+
+**Purpose:** Confirm you're pointed at the right tenant/subscription before creating
+anything — the most expensive mistake in this whole runbook is doing all of it in the
+wrong subscription.
+
+**Run:**
+```bash
+az login
+az account set --subscription "<subscription-id-or-name>"
+```
+
+**Verify:**
+```bash
+az account show --query "{name:name, id:id, tenantId:tenantId}" -o table
+```
+
+**Expected result:** The subscription name/ID/tenant match what you intend to deploy into.
+
+**Next:** Safe to continue only if the subscription shown is correct. If it's wrong, run
+`az account set` again before proceeding — every later step inherits this context silently.
+
+---
+
+### Step 2 — Resource Group (verify only — already exists)
+
+**Purpose:** `rg-colourcon-bbf-np-eus` already exists. Do not run `az group create` again —
+it's a harmless no-op on an existing group, but there's no reason to re-run a creation
+command for something already confirmed present.
+
+**Run:** *(nothing to create)*
+
+**Verify:**
+```bash
+az group show -n "$RG" --query "{name:name, location:location, state:properties.provisioningState}" -o table
+```
+
+**Expected result:** `provisioningState: Succeeded`, `location: eastus`.
+
+**Next:** Safe to continue.
+
+---
+
+### Step 3 — Virtual Network and subnets
+
+**Purpose:** Non-Prod is built to the same private-networking spec as Production (§1) —
+this VNet and its two subnets (one for Container Apps, one for private endpoints) are the
+foundation everything else attaches to.
+
+**Run:**
 ```bash
 az network vnet create -g "$RG" -n vnet-colorcon-bff-np-eus -l "$LOCATION" \
   --address-prefix 10.60.0.0/16 \
@@ -135,19 +184,52 @@ az network vnet subnet create -g "$RG" --vnet-name vnet-colorcon-bff-np-eus \
   --address-prefix 10.60.2.0/24
 ```
 
-**The Container Apps subnet must be delegated before the environment can use it** — this
-was missed on the first attempt and failed with
-`ManagedEnvironmentSubnetDelegationError: The subnet of the environment must be delegated
-to the service 'Microsoft.App/environments'`:
+**Verify:**
+```bash
+az network vnet subnet list -g "$RG" --vnet-name vnet-colorcon-bff-np-eus \
+  --query "[].{name:name, prefix:addressPrefix}" -o table
+```
 
+**Expected result:** Two subnets listed — `snet-colorcon-bff-aca-np-eus` (`10.60.0.0/23`)
+and `snet-colorcon-bff-pe-np-eus` (`10.60.2.0/24`).
+
+**Next:** Safe to continue. The Container Apps subnet is not usable yet — Step 4 is
+mandatory before Step 14.
+
+---
+
+### Step 4 — Delegate the Container Apps subnet
+
+**Purpose:** Azure Container Apps requires its infrastructure subnet to carry a specific
+service delegation. This is not applied automatically at subnet creation — it must be set
+explicitly, and Step 14 (Container Apps Environment) will fail without it (see Section 6,
+issue 1).
+
+**Run:**
 ```bash
 az network vnet subnet update -g "$RG" --vnet-name vnet-colorcon-bff-np-eus \
   -n snet-colorcon-bff-aca-np-eus \
   --delegations Microsoft.App/environments
 ```
 
-### 4.2 Log Analytics + Application Insights
+**Verify:**
+```bash
+az network vnet subnet show -g "$RG" --vnet-name vnet-colorcon-bff-np-eus \
+  -n snet-colorcon-bff-aca-np-eus --query "delegations[].serviceName" -o tsv
+```
 
+**Expected result:** `Microsoft.App/environments`
+
+**Next:** Safe to continue.
+
+---
+
+### Step 5 — Log Analytics Workspace + Application Insights
+
+**Purpose:** Central logging/telemetry destination for the Container Apps Environment and
+the application (Application Insights connection string is injected into the app).
+
+**Run:**
 ```bash
 az monitor log-analytics workspace create -g "$RG" -n law-colorcon-bff-np-eus -l "$LOCATION"
 
@@ -155,47 +237,132 @@ az monitor app-insights component create -g "$RG" -a appi-colorcon-bff-np-eus -l
   --workspace law-colorcon-bff-np-eus --application-type web
 ```
 
-**Retention defaults to 30 days and that's the platform floor for the standard `PerGB2018`
-SKU** — attempting `--retention-time 14` (the originally-planned Non-Prod value) fails with
-`InvalidParameter: 'RetentionInDays' property doesn't match the SKU limits`. 14 days is only
-reachable on the legacy Free SKU (500MB/day ingestion cap — not viable for a real
-workload). 30 days is the accepted value; the original "14 days for Non-Prod" target in
-issue #1 §20 was written without knowing about this platform limit.
+**Verify:**
+```bash
+az monitor log-analytics workspace show -g "$RG" -n law-colorcon-bff-np-eus \
+  --query "{state:provisioningState, retention:retentionInDays}" -o table
+```
 
-### 4.3 Managed identities
+**Expected result:** `state: Succeeded`, `retention: 30`. **Not 14** — 30 days is the
+platform-enforced floor for the standard `PerGB2018` SKU. Don't attempt to lower it (see
+Section 6, issue 5); this is the correct, final value.
 
+**Next:** Safe to continue.
+
+---
+
+### Step 6 — Managed identities
+
+**Purpose:** Two identities, deliberately kept separate — one for the *running app*
+(read-only access to its own Key Vault, pull-only on the ACR), one for *GitHub Actions*
+(push to the ACR, update the Container App). See ARCHITECTURE_CONCEPTS.md §5 for why
+merging these would violate least-privilege.
+
+**Run:**
 ```bash
 az identity create -g "$RG" -n id-colorcon-bff-runtime-np-eus -l "$LOCATION"
 az identity create -g "$RG" -n id-colorcon-bff-deploy-np-eus -l "$LOCATION"
 ```
 
-### 4.4 Key Vault (public first) + RBAC + secrets
+**Verify:**
+```bash
+az identity list -g "$RG" --query "[].{name:name, clientId:clientId}" -o table
+```
 
+**Expected result:** Both `id-colorcon-bff-runtime-np-eus` and
+`id-colorcon-bff-deploy-np-eus` listed, each with a `clientId`.
+
+**Next:** Safe to continue.
+
+---
+
+### Step 7 — Key Vault (create, public network access still enabled)
+
+**Purpose:** Stores `oauth-client-id`, `oauth-client-secret`, and later `redis-access-key`.
+Created with public access on for now — it gets locked to private-only in Step 21, only
+after the private path is proven working (never lock down before validating; see Step 21's
+Purpose).
+
+**Run:**
 ```bash
 az keyvault create -g "$RG" -n kv-colorcon-bff-np-eus -l "$LOCATION" --enable-rbac-authorization true
+```
 
+**Verify:**
+```bash
+az keyvault show -g "$RG" -n kv-colorcon-bff-np-eus \
+  --query "{rbac:properties.enableRbacAuthorization, publicAccess:properties.publicNetworkAccess}" -o table
+```
+
+**Expected result:** `rbac: True`, `publicAccess: Enabled`.
+
+**Next:** Safe to continue.
+
+---
+
+### Step 8 — Key Vault RBAC (runtime identity + your own account)
+
+**Purpose:** The runtime identity needs read access to secrets at runtime. Your own account
+needs write access to actually populate those secrets in Step 9 — RBAC mode grants nothing
+by default, not even to the vault's creator.
+
+**Run:**
+```bash
 KV_ID=$(az keyvault show -g "$RG" -n kv-colorcon-bff-np-eus --query id -o tsv)
 RUNTIME_PRINCIPAL=$(az identity show -g "$RG" -n id-colorcon-bff-runtime-np-eus --query principalId -o tsv)
+SELF_ID=$(az ad signed-in-user show --query id -o tsv)
+
 az role assignment create --assignee-object-id "$RUNTIME_PRINCIPAL" --assignee-principal-type ServicePrincipal \
   --role "Key Vault Secrets User" --scope "$KV_ID"
-
-# your own account needs write access too, to set secrets below
-SELF_ID=$(az ad signed-in-user show --query id -o tsv)
 az role assignment create --assignee-object-id "$SELF_ID" --assignee-principal-type User \
   --role "Key Vault Secrets Officer" --scope "$KV_ID"
 ```
 
-RBAC on Key Vault's data plane can lag by ~20s after the role assignment — wait briefly
-before setting secrets or you'll see a transient `Forbidden`:
-
+**Verify:**
 ```bash
-sleep 20
+az role assignment list --scope "$KV_ID" --query "[].{principal:principalId, role:roleDefinitionName}" -o table
+```
+
+**Expected result:** Two rows — the runtime identity's principal ID with `Key Vault Secrets
+User`, and your own account with `Key Vault Secrets Officer`.
+
+**Next:** Wait ~20 seconds before Step 9 — Key Vault's data-plane RBAC can lag behind the
+control-plane confirmation, and setting secrets immediately can return a transient
+`Forbidden`.
+
+---
+
+### Step 9 — Key Vault secrets
+
+**Purpose:** Populate the OAuth placeholder credentials the application reads at runtime.
+(Real OAuth provider credentials, when available, replace these same secret names — no
+code or infrastructure change needed.)
+
+**Run:**
+```bash
 az keyvault secret set --vault-name kv-colorcon-bff-np-eus --name oauth-client-id --value "<client-id>"
 az keyvault secret set --vault-name kv-colorcon-bff-np-eus --name oauth-client-secret --value "<client-secret>"
 ```
 
-### 4.5 Key Vault private endpoint + private DNS
+**Verify:**
+```bash
+az keyvault secret list --vault-name kv-colorcon-bff-np-eus --query "[].name" -o tsv
+```
 
+**Expected result:** `oauth-client-id` and `oauth-client-secret` both listed.
+
+**Next:** Safe to continue.
+
+---
+
+### Step 10 — Key Vault private endpoint + private DNS
+
+**Purpose:** Wires the private network path Step 21 will eventually make the *only* path.
+Four resources, always created together, verified as one unit: the private DNS zone, its
+link to the VNet, the private endpoint itself, and the DNS zone group that auto-registers
+the private A record.
+
+**Run:**
 ```bash
 az network private-dns zone create -g "$RG" -n privatelink.vaultcore.azure.net
 
@@ -222,62 +389,91 @@ az network private-endpoint dns-zone-group create -g "$RG" \
   --zone-name vaultcore
 ```
 
-Don't disable public access yet — that happens in §4.11, only after the Container App
-exists and the private path is validated end-to-end.
+**Verify:**
+```bash
+az network private-dns record-set a show -g "$RG" -z privatelink.vaultcore.azure.net \
+  -n kv-colorcon-bff-np-eus --query aRecords -o json
+```
 
-### 4.6 Azure Managed Redis (public first)
+**Expected result:** An IP address inside `10.60.2.0/24` (the private endpoint subnet) —
+in this build, `10.60.2.4`. If the returned address is *not* inside that range, something
+is wired to the wrong subnet — stop and investigate before continuing.
 
+**Next:** Safe to continue.
+
+---
+
+### Step 11 — Azure Managed Redis cluster + database
+
+**Purpose:** Token cache for OAuth access tokens (ARCHITECTURE_CONCEPTS.md §10). This step
+has a real platform inconsistency baked into it — read the Verify step carefully, it's not
+optional.
+
+**Run:**
 ```bash
 az redisenterprise create --cluster-name redis-colorcon-bff-np-eus -g "$RG" -l "$LOCATION" \
   --sku Balanced_B0 --minimum-tls-version "1.2" --public-network-access Enabled
 ```
 
-**Whether this alone provisions a usable default database is inconsistent** — in one run it
-silently created nothing (`az redisenterprise database list` came back empty); in another
-run it auto-created one with the wrong clustering policy (`OSSCluster` instead of
-`NoCluster`). Either way, don't trust the auto-created database — check explicitly and fix
-it:
-
+**Verify:**
 ```bash
 az redisenterprise database list -g "$RG" --cluster-name redis-colorcon-bff-np-eus -o json
 ```
 
-If empty, create it explicitly. **Note: this CLI extension takes no `--database-name`
-flag** — there's exactly one database per cluster, implicitly named `default`:
+**Expected result — one of two outcomes, both require action:**
 
-```bash
-az redisenterprise database create -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
-  --clustering-policy NoCluster --client-protocol Encrypted --eviction-policy VolatileLRU
-```
+- **Empty list** → no database was auto-created. Create it explicitly:
+  ```bash
+  az redisenterprise database create -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
+    --clustering-policy NoCluster --client-protocol Encrypted --eviction-policy VolatileLRU
+  ```
+- **One database exists, but `clusteringPolicy` is `OSSCluster`** (not `NoCluster`) → a
+  default database was auto-created with the wrong policy. Clustering policy cannot be
+  changed on an existing database (see Section 6, issue 3) — delete and recreate:
+  ```bash
+  az redisenterprise database delete -g "$RG" --cluster-name redis-colorcon-bff-np-eus --yes
+  az redisenterprise database create -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
+    --clustering-policy NoCluster --client-protocol Encrypted --eviction-policy VolatileLRU
+  ```
 
-If one already exists with the wrong clustering policy, **it can't be changed in place** —
-`az redisenterprise database create` on an existing database returns
-`BadRequest: 'properties.clusteringPolicy' cannot be changed... You must create a new
-database`. Delete and recreate:
+Re-run the Verify command after either fix. Do not proceed until `clusteringPolicy:
+NoCluster` is confirmed — the app's plain `redis-py` client is not cluster-aware.
 
-```bash
-az redisenterprise database delete -g "$RG" --cluster-name redis-colorcon-bff-np-eus --yes
-az redisenterprise database create -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
-  --clustering-policy NoCluster --client-protocol Encrypted --eviction-policy VolatileLRU
-```
+**Next:** Safe to continue only once `clusteringPolicy: NoCluster` is confirmed.
 
-**Access-key authentication defaults to `Disabled`** as of this CLI version (ahead of a
-scheduled breaking-change release) — enable it explicitly, since the app authenticates with
-a key via Key Vault, not Entra ID:
+---
 
+### Step 12 — Enable Redis access-key authentication
+
+**Purpose:** Access keys default to `Disabled` on newly created databases as of this CLI
+version, ahead of a scheduled breaking-change release. The app authenticates with a key
+(via Key Vault), not Entra ID, so this must be turned on explicitly.
+
+**Run:**
 ```bash
 az redisenterprise database update -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
   --access-keys-authentication Enabled
 ```
 
-### 4.7 Redis private endpoint + private DNS
+**Verify:**
+```bash
+az redisenterprise database show -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
+  --query accessKeysAuthentication -o tsv
+```
 
-The generic `az network private-link-resource list --type` command's client-side type
-validation doesn't include `Microsoft.Cache/redisEnterprise` in this CLI version — that's
-just an outdated allowlist in the command itself, not a sign private endpoints aren't
-supported. Skip that check and create the endpoint directly with the documented group ID
-(`redisEnterprise`), which works:
+**Expected result:** `Enabled`
 
+**Next:** Safe to continue.
+
+---
+
+### Step 13 — Redis private endpoint + private DNS
+
+**Purpose:** Same pattern as Step 10, for Redis instead of Key Vault. The private-link
+group ID (`redisEnterprise`) is not obvious/documented in the generic private-link-resource
+list command (see Section 6, issue 6) — it's given directly here rather than derived.
+
+**Run:**
 ```bash
 REDIS_ID=$(az redisenterprise show -g "$RG" --cluster-name redis-colorcon-bff-np-eus --query id -o tsv)
 
@@ -304,20 +500,28 @@ az network private-endpoint dns-zone-group create -g "$RG" \
   --zone-name redis
 ```
 
-To *prove* the private path is wired correctly before relying on it, check the DNS record's
-actual IP is inside the private endpoint subnet's range (`10.60.2.0/24`), rather than just
-assuming the zone-group creation worked:
-
+**Verify:**
 ```bash
-az network private-dns record-set a show -g "$RG" -z privatelink.vaultcore.azure.net -n kv-colorcon-bff-np-eus --query aRecords -o json
-az network private-dns record-set a show -g "$RG" -z privatelink.redis.azure.net -n redis-colorcon-bff-np-eus.eastus --query aRecords -o json
-# both returned 10.60.2.x addresses, confirming correct wiring
+az network private-dns record-set a show -g "$RG" -z privatelink.redis.azure.net \
+  -n redis-colorcon-bff-np-eus.eastus --query aRecords -o json
 ```
 
-### 4.8 Container Apps Environment (zone-redundant, VNet-integrated)
+**Expected result:** An IP inside `10.60.2.0/24` — in this build, `10.60.2.5`.
 
+**Next:** Safe to continue.
+
+---
+
+### Step 14 — Container Apps Environment (zone-redundant, VNet-integrated)
+
+**Purpose:** The compute environment the Container App runs inside — this is where zone
+redundancy and VNet integration are actually configured; the Container App itself just
+inherits them.
+
+**Run:**
 ```bash
-SUBNET_ID=$(az network vnet subnet show -g "$RG" --vnet-name vnet-colorcon-bff-np-eus -n snet-colorcon-bff-aca-np-eus --query id -o tsv)
+SUBNET_ID=$(az network vnet subnet show -g "$RG" --vnet-name vnet-colorcon-bff-np-eus \
+  -n snet-colorcon-bff-aca-np-eus --query id -o tsv)
 LAW_ID=$(az monitor log-analytics workspace show -g "$RG" -n law-colorcon-bff-np-eus --query customerId -o tsv)
 LAW_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n law-colorcon-bff-np-eus --query primarySharedKey -o tsv)
 
@@ -327,14 +531,28 @@ az containerapp env create -g "$RG" -n cae-colorcon-bff-np-eus -l "$LOCATION" \
   --zone-redundant
 ```
 
-`--zone-redundant` requires `--infrastructure-subnet-resource-id` — omitting it errors
-immediately. Zone redundancy is fully supported on the default `Consumption` workload
-profile (confirmed against Microsoft's reliability docs — no need to switch to a Dedicated
-workload profile), provided the infrastructure subnet is `/23` or larger, which
-`snet-colorcon-bff-aca-np-eus` already is.
+*(Requires Step 4's subnet delegation to already be in place — if this fails with
+`ManagedEnvironmentSubnetDelegationError`, go back and confirm Step 4 actually completed.)*
 
-### 4.9 RBAC on the shared ACR (interim `acrbffeus`)
+**Verify:**
+```bash
+az containerapp env show -g "$RG" -n cae-colorcon-bff-np-eus \
+  --query "{state:properties.provisioningState, zoneRedundant:properties.zoneRedundant}" -o table
+```
 
+**Expected result:** `state: Succeeded`, `zoneRedundant: True`.
+
+**Next:** Safe to continue.
+
+---
+
+### Step 15 — RBAC on the shared ACR (interim `acrbffeus`)
+
+**Purpose:** Grants the runtime identity pull access (to run the app's image) and the
+deploy identity push access (for the CI/CD pipeline). This ACR is interim — it lives in the
+old `rg-bff-shared-eus`, reused until a `colorcon`-named shared registry exists (§7).
+
+**Run:**
 ```bash
 ACR_ID=$(az acr show -n acrbffeus --query id -o tsv)
 RUNTIME_PRINCIPAL=$(az identity show -g "$RG" -n id-colorcon-bff-runtime-np-eus --query principalId -o tsv)
@@ -346,14 +564,26 @@ az role assignment create --assignee-object-id "$DEPLOY_PRINCIPAL" --assignee-pr
   --role AcrPush --scope "$ACR_ID"
 ```
 
-### 4.10 Container App — create first, patch in probes
+**Verify:**
+```bash
+az role assignment list --scope "$ACR_ID" --query "[].{principal:principalId, role:roleDefinitionName}" -o table
+```
 
-`az containerapp create` has no flags for custom health probes — they only exist in the
-YAML schema. Rather than hand-write that YAML from memory (the first attempt failed with an
-opaque `The JSON value could not be converted to System.Boolean` schema error), create the
-app first with plain flags — proven to work — then export its *real* YAML as ground truth
-and patch probes into that.
+**Expected result:** The runtime identity's principal ID with `AcrPull`, the deploy
+identity's with `AcrPush`.
 
+**Next:** Safe to continue.
+
+---
+
+### Step 16 — Container App: initial create (no probes yet)
+
+**Purpose:** Get a working, reachable Container App up first with plain CLI flags — proven
+reliable — before attempting the more fragile custom-probes YAML in Step 17. Trying to do
+both at once (hand-written YAML with probes on first creation) is exactly what failed in
+Section 6, issue 4.
+
+**Run:**
 ```bash
 RUNTIME_ID=$(az identity show -g "$RG" -n id-colorcon-bff-runtime-np-eus --query id -o tsv)
 RUNTIME_CLIENT_ID=$(az identity show -g "$RG" -n id-colorcon-bff-runtime-np-eus --query clientId -o tsv)
@@ -383,70 +613,88 @@ az containerapp create -g "$RG" -n ca-colorcon-bff-np-eus \
     "APPLICATIONINSIGHTS_CONNECTION_STRING=$APPI_CONN"
 ```
 
-`minReplicas=0/maxReplicas=1` was an explicit cost call for Non-Prod — note the zone
-redundancy caveat in §1. `ENVIRONMENT=non-production` (not the original PRD's `dev`)
-reflects the shared 7-branch Non-Prod platform this environment actually is — see
-ARCHITECTURE_CONCEPTS.md §12 for the fuller reasoning, and the still-open question there
-about eventually moving to a `PLATFORM_ENVIRONMENT` + hostname-routing scheme.
+**Verify:**
+```bash
+curl https://<container-app-fqdn>/health
+```
 
-Now export the real YAML and patch in the three probes (Startup only checks the app is up;
-Liveness deliberately checks nothing external — see ARCHITECTURE_CONCEPTS.md §13 for why
-mixing in Redis/Key Vault checks there would turn a transient dependency blip into an
-unnecessary container restart):
+**Expected result:** `{"status":"ok"}`, HTTP 200.
 
+**Next:** Safe to continue.
+
+---
+
+### Step 17 — Add the three health probes
+
+**Purpose:** `az containerapp create`/`update` has no flags for custom health probes —
+they only exist in the YAML schema. Rather than hand-write that YAML from memory (see
+Section 6, issue 4), export the app's *real* current configuration and edit that.
+
+**Run:**
 ```bash
 az containerapp show -g "$RG" -n ca-colorcon-bff-np-eus -o yaml > /tmp/ca-update.yaml
-# Edit /tmp/ca-update.yaml in place: add a `probes:` list under
-# properties.template.containers[0], alongside the existing fields (env, image, name,
-# resources). Trim read-only/computed top-level fields first — id, systemData,
-# provisioningState, outboundIpAddresses, eventStreamEndpoint, customDomainVerificationId,
-# latestRevisionName/Fqdn — the update call can reject an unedited full export.
 ```
 
-The probes block that worked:
+Edit `/tmp/ca-update.yaml`:
+1. Trim read-only/computed top-level fields — `id`, `systemData`, `provisioningState`,
+   `outboundIpAddresses`, `eventStreamEndpoint`, `customDomainVerificationId`,
+   `latestRevisionName`/`latestRevisionFqdn`.
+2. Under `properties.template.containers[0]`, add:
 
 ```yaml
-probes:
-- type: Startup
-  httpGet:
-    path: /health/startup
-    port: 8000
-  initialDelaySeconds: 3
-  periodSeconds: 5
-  failureThreshold: 10
-- type: Liveness
-  httpGet:
-    path: /health/live
-    port: 8000
-  initialDelaySeconds: 5
-  periodSeconds: 10
-  failureThreshold: 3
-- type: Readiness
-  httpGet:
-    path: /health/ready
-    port: 8000
-  initialDelaySeconds: 5
-  periodSeconds: 10
-  failureThreshold: 3
+      probes:
+      - type: Startup
+        httpGet:
+          path: /health/startup
+          port: 8000
+        initialDelaySeconds: 3
+        periodSeconds: 5
+        failureThreshold: 10
+      - type: Liveness
+        httpGet:
+          path: /health/live
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        failureThreshold: 3
+      - type: Readiness
+        httpGet:
+          path: /health/ready
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        failureThreshold: 3
 ```
 
-Apply it and verify the probes actually landed — don't trust a clean exit code alone:
+Liveness deliberately checks nothing external (ARCHITECTURE_CONCEPTS.md §13) — a transient
+Redis blip should never trigger a container restart.
 
 ```bash
 az containerapp update -g "$RG" -n ca-colorcon-bff-np-eus --yaml /tmp/ca-update.yaml
+```
 
+**Verify:**
+```bash
 az containerapp show -g "$RG" -n ca-colorcon-bff-np-eus \
   --query "properties.template.containers[0].probes" -o json
 ```
 
-`/health/startup` is a new endpoint (`app/main.py`) added specifically for this — it didn't
-exist before this build, since the original 2-probe (`/health`, `/health/live`,
-`/health/ready`) design had no dedicated startup check.
+**Expected result:** All three probe types (`Startup`, `Liveness`, `Readiness`) present
+with the correct paths. **Don't trust a clean `update` exit code alone** — the probes have
+silently failed to apply before with no error; always re-query and look.
 
-### 4.11 GitHub OIDC federation + Container Apps RBAC for the deploy identity
+**Next:** Safe to continue.
 
-Same subject-format rules as CICD_SETUP.md §3 — fetch the real prefix, don't guess it:
+---
 
+### Step 18 — GitHub OIDC federation
+
+**Purpose:** Lets GitHub Actions authenticate as the deploy identity with no stored Azure
+secret. The subject string must be fetched, never guessed (see CICD_SETUP.md §3.1 for the
+full reasoning — the format includes immutable numeric org/repo IDs on this GitHub
+platform version).
+
+**Run:**
 ```bash
 SUB_PREFIX=$(gh api repos/bsarkarlabs-stack/bff-demo/actions/oidc/customization/sub --jq ".sub_claim_prefix")
 
@@ -459,11 +707,28 @@ az identity federated-credential create \
   --audiences api://AzureADTokenExchange
 ```
 
-The deploy identity also needs `Container Apps Contributor` scoped to the app itself —
-without this, the pipeline's `az containerapp update` fails with a 404-shaped "does not
-exist" error that masks the real RBAC cause (see CICD_SETUP.md §4.2 for the full
-explanation):
+**Verify:**
+```bash
+az identity federated-credential list --identity-name id-colorcon-bff-deploy-np-eus \
+  -g "$RG" --query "[].subject" -o tsv
+```
 
+**Expected result:** A subject ending in `:environment:non-production`, prefixed with
+`repo:bsarkarlabs-stack@<numeric-id>/bff-demo@<numeric-id>` — not a plain
+`repo:bsarkarlabs-stack/bff-demo` and not a `:ref:refs/heads/...` suffix (see Section 6,
+issue 2 for what happens if either is wrong).
+
+**Next:** Safe to continue.
+
+---
+
+### Step 19 — Deploy identity RBAC on the Container App
+
+**Purpose:** Without this, the pipeline's `az containerapp update` fails with a 404-shaped
+"does not exist" error that looks like a naming bug but is actually a permissions gap (see
+Section 6, issue 8). ACR roles (Step 15) are not sufficient on their own.
+
+**Run:**
 ```bash
 CA_ID=$(az containerapp show -g "$RG" -n ca-colorcon-bff-np-eus --query id -o tsv)
 DEPLOY_PRINCIPAL=$(az identity show -g "$RG" -n id-colorcon-bff-deploy-np-eus --query principalId -o tsv)
@@ -472,107 +737,356 @@ az role assignment create --assignee-object-id "$DEPLOY_PRINCIPAL" --assignee-pr
   --role "Container Apps Contributor" --scope "$CA_ID"
 ```
 
-### 4.12 GitHub secrets
+**Verify:**
+```bash
+az role assignment list --scope "$CA_ID" --query "[].roleDefinitionName" -o tsv
+```
 
-Update the existing `non-production` GitHub Environment's secrets to point at the new
-resources. **Use `printf`, not `echo`** — see CICD_SETUP.md §5 for why `echo | gh secret
-set` silently corrupts the value with a trailing newline:
+**Expected result:** `Container Apps Contributor` listed.
 
+**Next:** Safe to continue. Allow ~30 seconds for RBAC propagation before triggering a
+pipeline run.
+
+---
+
+### Step 20 — GitHub Environment + secrets
+
+**Purpose:** Environment-scoped (not repo-wide) secrets, so a `master`-branch deploy can
+never see the `non-production` credentials or vice versa.
+
+**Run:**
 ```bash
 REPO=bsarkarlabs-stack/bff-demo
 
-CLIENT_ID=$(az identity show -g "$RG" -n id-colorcon-bff-deploy-np-eus --query clientId -o tsv)
-TENANT_ID=$(az account show --query tenantId -o tsv)
-SUB_ID=$(az account show --query id -o tsv)
+gh api --method PUT "repos/$REPO/environments/non-production"
 
-printf '%s' "$CLIENT_ID" | gh secret set AZURE_CLIENT_ID --env non-production --repo "$REPO"
-printf '%s' "$TENANT_ID" | gh secret set AZURE_TENANT_ID --env non-production --repo "$REPO"
-printf '%s' "$SUB_ID" | gh secret set AZURE_SUBSCRIPTION_ID --env non-production --repo "$REPO"
+printf '%s' "$(az identity show -g "$RG" -n id-colorcon-bff-deploy-np-eus --query clientId -o tsv)" \
+  | gh secret set AZURE_CLIENT_ID --env non-production --repo "$REPO"
+printf '%s' "$(az account show --query tenantId -o tsv)" \
+  | gh secret set AZURE_TENANT_ID --env non-production --repo "$REPO"
+printf '%s' "$(az account show --query id -o tsv)" \
+  | gh secret set AZURE_SUBSCRIPTION_ID --env non-production --repo "$REPO"
 printf '%s' "acrbffeus" | gh secret set ACR_NAME --env non-production --repo "$REPO"
 printf '%s' "$RG" | gh secret set RESOURCE_GROUP --env non-production --repo "$REPO"
 printf '%s' "ca-colorcon-bff-np-eus" | gh secret set CONTAINER_APP_NAME --env non-production --repo "$REPO"
 printf '%s' "https://<container-app-fqdn>" | gh secret set CONTAINER_APP_URL --env non-production --repo "$REPO"
 ```
 
-### 4.13 Validate the private paths, then lock down public access
+**Verify:**
+```bash
+gh secret list --env non-production --repo "$REPO"
+```
 
-**Don't disable public access first and hope** — validate the private path actually works
-while public access is still available as a fallback, per the hardening order in
-ARCHITECTURE_CONCEPTS.md §9. Two ways to validate, both used here:
+**Expected result:** All 7 secrets listed with recent `Updated` timestamps.
 
-1. Confirm the private DNS A records resolve to addresses inside the private endpoint
-   subnet (done in §4.7 above — `10.60.2.4` for Key Vault, `10.60.2.5` for Redis).
-2. The definitive test: disable public access, then confirm the app still works.
+**Next:** Safe to continue. **Never use `echo` in place of `printf` here** — see Section 6,
+issue 7.
 
+---
+
+### Step 21 — Validate the private path, then lock down Key Vault
+
+**Purpose:** Prove the private endpoint actually works *before* removing the public
+fallback — never disable public access on faith (ARCHITECTURE_CONCEPTS.md §9).
+
+**Run:**
+```bash
+curl https://<container-app-fqdn>/token
+```
+
+**Verify:**
+```bash
+az containerapp logs show -g "$RG" -n ca-colorcon-bff-np-eus --tail 20
+```
+
+**Expected result:** The `curl` returns `502 {"detail":"Failed to obtain token"}` — that's
+correct, since the OAuth secrets are still placeholders. What matters is the log trace:
+it must show `httpx.UnsupportedProtocol` (the empty placeholder `OAUTH_TOKEN_URL`), which
+only happens *after* a successful Key Vault read. If instead you see a Key Vault
+connection/auth error, the private path isn't working — stop, do not proceed to disable
+public access.
+
+**Next — only if the above passed:**
 ```bash
 az keyvault update -g "$RG" -n kv-colorcon-bff-np-eus --public-network-access Disabled
 ```
+Re-run the `curl`/log check above. Same result (502 at the OAuth step, not a Key Vault
+error) confirms Key Vault is now working over the private endpoint exclusively.
 
+---
+
+### Step 22 — Validate the private path, then lock down Redis
+
+**Purpose:** Same discipline as Step 21, for Redis.
+
+**Run:**
 ```bash
-curl https://<container-app-fqdn>/token
-# 502 "Failed to obtain token" is EXPECTED here (placeholder OAuth credentials) — what
-# matters is that the failure trace (az containerapp logs show) proves it got past the
-# Key Vault read via httpx.UnsupportedProtocol on the empty OAUTH_TOKEN_URL, not a Key
-# Vault connection/auth error. That's proof the private path works.
+curl https://<container-app-fqdn>/health/ready
 ```
 
+**Verify:** Response body and status code directly (no log inspection needed here).
+
+**Expected result:** `{"status":"ready"}`, HTTP 200.
+
+**Next — only if the above passed:**
 ```bash
 az redisenterprise update -g "$RG" --cluster-name redis-colorcon-bff-np-eus --public-network-access Disabled
-curl https://<container-app-fqdn>/health/ready
-# 200 {"status":"ready"} confirms Redis over the private endpoint only
 ```
+Re-run the `curl` above. Same `200 {"status":"ready"}` confirms Redis is now private-only.
 
-Note: control-plane operations (`az keyvault update`, `az redisenterprise update`) go
-through ARM and are **not** blocked by the resource's own network rules — disabling public
-data-plane access doesn't lock you out of managing the resource via `az cli`, only out of
-reading/writing secrets or cache data from outside the VNet.
+Note for both Step 21 and 22: disabling public *data-plane* access does not lock you out of
+managing the resource — `az keyvault update` / `az redisenterprise update` are
+control-plane (ARM) calls and remain reachable regardless of the resource's own network
+rules.
 
-### 4.14 Housekeeping: orphaned RBAC after a resource group deletion
+---
 
-If a resource group holding identities that had RBAC grants elsewhere gets deleted (as
-happened here — an earlier `rg-bff-np-eus` was deleted mid-project), the role assignments
-on resources *outside* that group (the shared ACR) don't get cleaned up automatically —
-they become orphaned, showing a blank `principalName` since the principal no longer
-resolves:
+## 5. Verification checklist (cumulative status)
 
+See [issue #3](https://github.com/bsarkarlabs-stack/bff-demo/issues/3) for the live,
+authoritative checklist. As of the last update:
+
+- [x] All 4 health endpoints (`/health`, `/health/startup`, `/health/live`, `/health/ready`) return 200
+- [x] All 3 probes confirmed present on the live resource
+- [x] `/token` and `/health/ready` both confirmed working with Key Vault and Redis public
+      access fully disabled
+- [x] GitHub Actions pipeline runs green end-to-end against `ca-colorcon-bff-np-eus`
+- [x] Deployed image tag matches the triggering commit SHA
+- [x] Zone redundancy confirmed active on both the Container Apps Environment and Redis
+- [ ] Tag audit (mandatory tags applied across all resources) — not yet done
+- [ ] Cross-environment isolation test — blocked on Production existing
+
+---
+
+## 6. Troubleshooting & command history (failed attempts)
+
+Every one of these actually happened during this build. Kept separate from Section 4 so
+the primary runbook stays clean, but preserved in full because the fix often isn't obvious
+without seeing the failure first.
+
+**ISSUE FOUND — 1**
+
+Existing command:
 ```bash
-ACR_ID=$(az acr show -n acrbffeus --query id -o tsv)
-az role assignment list --scope "$ACR_ID" -o json
-# entries with empty principalName are orphaned; cross-check principalId against
-# currently-existing identities before deleting anything
-az role assignment delete --ids "<orphaned-assignment-id>" "<another-orphaned-id>"
+az containerapp env create -g "$RG" -n cae-colorcon-bff-np-eus -l "$LOCATION" \
+  --logs-workspace-id "$LAW_ID" --logs-workspace-key "$LAW_KEY" \
+  --infrastructure-subnet-resource-id "$SUBNET_ID" --zone-redundant
+# ...run before the subnet had been delegated
 ```
+Problem: `ManagedEnvironmentSubnetDelegationError: The subnet of the environment must be
+delegated to the service 'Microsoft.App/environments'`.
+Correct command:
+```bash
+az network vnet subnet update -g "$RG" --vnet-name vnet-colorcon-bff-np-eus \
+  -n snet-colorcon-bff-aca-np-eus --delegations Microsoft.App/environments
+# then retry the containerapp env create
+```
+Why: Container Apps VNet integration requires this specific subnet delegation; it is never
+applied automatically, regardless of when the subnet was created. This fix is now folded
+into the primary runbook as Step 4, run before Step 14.
 
 ---
 
-## 5. Validation checklist
+**ISSUE FOUND — 2**
 
-See [issue #3](https://github.com/bsarkarlabs-stack/bff-demo/issues/3) for the full,
-currently-in-progress checklist — cross-environment isolation, pipeline end-to-end trigger,
-tag audit, and zone-redundancy sanity checks are still open.
-
-Already confirmed in this build:
-
-- [x] `/health`, `/health/startup`, `/health/live`, `/health/ready` all return 200
-- [x] All 3 probes verified present on the live resource (not just assumed from a clean
-      `update` exit code)
-- [x] `/token` reaches Key Vault successfully via the runtime managed identity, over the
-      private endpoint only (public access disabled), failing only at the placeholder
-      OAuth call
-- [x] `/health/ready` returns 200 against Redis over the private endpoint only (public
-      access disabled)
-- [x] No secrets appear in any log line across every failure trace inspected
+Existing command:
+```bash
+az identity federated-credential create --name gh-oidc-np --identity-name id-colorcon-bff-deploy-np-eus \
+  --resource-group "$RG" --issuer https://token.actions.githubusercontent.com \
+  --subject "repo:bsarkarlabs-stack/bff-demo:ref:refs/heads/develop" \
+  --audiences api://AzureADTokenExchange
+```
+Problem: `AADSTS700213: No matching federated identity record found for presented
+assertion subject 'repo:bsarkarlabs-stack@316735306/bff-demo@1333575135:environment:non-production'`.
+Two separate mistakes compounded: (a) the workflow's `deploy` job sets `environment:
+non-production`, which changes GitHub's OIDC subject format entirely, from
+`:ref:refs/heads/<branch>` to `:environment:<name>`; (b) the org/repo segment isn't the
+plain name at all — it includes immutable numeric IDs.
+Correct command:
+```bash
+SUB_PREFIX=$(gh api repos/bsarkarlabs-stack/bff-demo/actions/oidc/customization/sub --jq ".sub_claim_prefix")
+az identity federated-credential create --name gh-oidc-np-environment \
+  --identity-name id-colorcon-bff-deploy-np-eus --resource-group "$RG" \
+  --issuer https://token.actions.githubusercontent.com \
+  --subject "${SUB_PREFIX}:environment:non-production" \
+  --audiences api://AzureADTokenExchange
+```
+Why: Never guess the OIDC subject — query it. This is Step 18 in the primary runbook.
 
 ---
 
-## 6. Explicitly deferred
+**ISSUE FOUND — 3**
 
-- Shared `colorcon`-named RG/ACR (`rg-colorcon-bff-shared-eus` / `acrcolorconbffeus`) — the
-  interim `acrbffeus` is still in use; migrate once the new shared RG exists.
-- Production environment — same pattern, not started.
-- Custom domain / DNS / TLS, production alerting, production HA sizing, full CI/CD policy
-  review — all tracked as deferred-with-a-reason in
+Existing command:
+```bash
+az redisenterprise database create -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
+  --clustering-policy NoCluster --client-protocol Encrypted --eviction-policy VolatileLRU
+# run immediately after `az redisenterprise create`, assuming no database existed yet
+```
+Problem: `BadRequest: 'properties.clusteringPolicy' cannot be changed. Clustering policy
+cannot be changed for an existing database.` — `az redisenterprise create` had already
+auto-provisioned a default database with the `OSSCluster` policy; this command was
+attempting to change it in place rather than create a new one.
+Correct command:
+```bash
+az redisenterprise database list -g "$RG" --cluster-name redis-colorcon-bff-np-eus -o json   # check first
+az redisenterprise database delete -g "$RG" --cluster-name redis-colorcon-bff-np-eus --yes    # if wrong policy found
+az redisenterprise database create -g "$RG" --cluster-name redis-colorcon-bff-np-eus \
+  --clustering-policy NoCluster --client-protocol Encrypted --eviction-policy VolatileLRU
+```
+Why: `az redisenterprise create`'s behavior around auto-creating a default database is
+inconsistent across runs — sometimes none is created, sometimes one is created with the
+wrong policy. Always check explicitly (Step 11) rather than assuming either outcome.
+Clustering policy can only be set at creation time.
+
+---
+
+**ISSUE FOUND — 4**
+
+Existing command: a hand-written full Container App YAML (including a `probes:` block),
+passed directly to `az containerapp create --yaml`, composed from memory/documentation
+rather than a real exported example.
+Problem: `Bad Request: {"...":"The JSON value could not be converted to System.Boolean...
+Path: $ | LineNumber: 0 | BytePositionInLine: 4."}` — an opaque schema error with no
+indication of which field was malformed.
+Correct command: Create the app first with plain flags (no probes) — Step 16. Then export
+its real configuration with `az containerapp show -o yaml`, edit *that* file to add the
+`probes:` block, and apply with `az containerapp update --yaml` — Step 17.
+Why: The Container App YAML schema has enough easy-to-miss fields (exact key casing,
+required-vs-computed properties) that hand-writing it from scratch is unreliable. Starting
+from a real, platform-validated export removes that entire category of error.
+
+---
+
+**ISSUE FOUND — 5**
+
+Existing command:
+```bash
+az monitor log-analytics workspace update -g "$RG" -n law-colorcon-bff-np-eus --retention-time 14
+```
+Problem: `InvalidParameter: 'RetentionInDays' property doesn't match the SKU limits` — 14
+days is below the minimum retention allowed on the standard `PerGB2018` pricing tier.
+Correct command: No override needed — the default (30 days) is already the correct,
+final value. If explicit: `az monitor log-analytics workspace update -g "$RG" -n
+law-colorcon-bff-np-eus --retention-time 30`.
+Why: 30 days is the platform-enforced floor for this SKU. Sub-30-day retention exists only
+on the legacy Free tier (500MB/day ingestion cap — not viable for a real workload). The
+originally-planned "14 days for Non-Prod" target (issue #1 §20) was written without
+knowing about this platform limit; 30 days is the corrected, accepted value.
+
+---
+
+**ISSUE FOUND — 6**
+
+Existing command:
+```bash
+az network private-link-resource list --name redis-colorcon-bff-np-eus -g "$RG" \
+  --type Microsoft.Cache/redisEnterprise
+```
+Problem: `'Microsoft.Cache/redisEnterprise' is not a valid value for '--type'` — this
+generic command's client-side type validation list doesn't include Redis Enterprise in
+this CLI version. This is an outdated allowlist in the command itself, not a sign private
+endpoints aren't supported for Redis Enterprise.
+Correct command: Skip this exploratory check entirely and create the private endpoint
+directly with the documented group ID:
+```bash
+az network private-endpoint create -g "$RG" -n pe-redis-colorcon-bff-np-eus \
+  --vnet-name vnet-colorcon-bff-np-eus --subnet snet-colorcon-bff-pe-np-eus \
+  --private-connection-resource-id "$REDIS_ID" --group-id redisEnterprise \
+  --connection-name pe-conn-redis-colorcon-bff-np-eus
+```
+Why: `redisEnterprise` is the correct, documented private-link group ID for
+`Microsoft.Cache/redisEnterprise` — confirmed by the private endpoint creating
+successfully and the DNS record resolving correctly (Step 13). This is now folded directly
+into the primary runbook without the failed discovery step.
+
+---
+
+**ISSUE FOUND — 7**
+
+Existing command:
+```bash
+gh secret set AZURE_CLIENT_ID --env non-production --repo bsarkarlabs-stack/bff-demo <<< "$CLIENT_ID"
+# equivalent in effect to: echo "$CLIENT_ID" | gh secret set ...
+```
+Problem: `az containerapp update` in the pipeline failed with `ERROR: The containerapp
+'***' does not exist` even though the app was demonstrably running. Root cause: `echo`
+appends a trailing newline that becomes part of the stored secret value —
+`CONTAINER_APP_NAME` silently became `"ca-colorcon-bff-np-eus\n"`, and every downstream
+`az` lookup failed with the same not-found-shaped error, which reads like an RBAC or
+naming bug rather than a whitespace one.
+Correct command:
+```bash
+printf '%s' "$CLIENT_ID" | gh secret set AZURE_CLIENT_ID --env non-production --repo "$REPO"
+```
+Why: `printf '%s'` emits no trailing newline. This is Step 20 in the primary runbook —
+`printf`, never `echo`, for every secret value.
+
+---
+
+**ISSUE FOUND — 8**
+
+Existing command: (deploy identity had `AcrPush`/`AcrPull` from Step 15 only — no explicit
+attempt, just a missing step)
+Problem: `az containerapp update` in the pipeline failed with `ERROR: The containerapp
+'***' does not exist`. Azure Resource Manager returns a 404-shaped error for RBAC-denied
+reads rather than a 403, specifically to avoid confirming a resource's existence to
+callers who can't see it — so the failure reads like a naming/scope bug, not a permissions
+one.
+Correct command:
+```bash
+az role assignment create --assignee-object-id "$DEPLOY_PRINCIPAL" \
+  --assignee-principal-type ServicePrincipal --role "Container Apps Contributor" --scope "$CA_ID"
+```
+Why: ACR roles only cover pushing the image to the registry — a completely separate
+permission is needed to actually update the Container App resource. This is Step 19 in the
+primary runbook; easy to forget because the pipeline gets much further (through OIDC
+login, ACR login, and image push) before failing on this specific gap.
+
+---
+
+**ISSUE FOUND — 9**
+
+Existing command:
+```bash
+az containerapp exec -g "$RG" -n ca-colorcon-bff-np-eus \
+  --command "python -c \"import socket; print(socket.gethostbyname('kv-colorcon-bff-np-eus.vault.azure.net'))\""
+```
+Problem: `termios.error: (25, 'Inappropriate ioctl for device')` — `az containerapp exec`
+requires an interactive TTY and cannot be driven through a non-interactive automation
+session.
+Correct command:
+```bash
+az network private-dns record-set a show -g "$RG" -z privatelink.vaultcore.azure.net \
+  -n kv-colorcon-bff-np-eus --query aRecords -o json
+```
+Why: Confirming the private DNS zone's A record resolves to an address inside the private
+endpoint subnet is sufficient proof the private path is wired correctly, and needs no
+interactive session at all. This is the Verify step used in Step 10 and Step 13.
+
+---
+
+## 7. Optional / deferred steps
+
+Not part of the required path above — either genuinely optional, or blocked on something
+outside this runbook's control.
+
+- **Migrate off the interim `acrbffeus`** once `rg-colorcon-bff-shared-eus` /
+  `acrcolorconbffeus` exist (issue #2). Update the image reference and RBAC grants (Steps
+  15, 16, 20) to point at the new registry.
+- **Apply the mandatory tag set** (`client`, `application`, `environment`, `owner`,
+  `managedBy` — §2) across every resource in `rg-colourcon-bbf-np-eus`. Genuinely not done
+  yet (issue #3).
+- **Orphaned RBAC cleanup** — already performed once, for role assignments left over from
+  an earlier, now-deleted `rg-bff-np-eus`:
+  ```bash
+  az role assignment list --scope "$ACR_ID" -o json   # entries with empty principalName are orphaned
+  az role assignment delete --ids "<orphaned-assignment-id>"
+  ```
+  Re-check if any resource group holding identities with grants elsewhere is ever deleted
+  again — those grants don't clean themselves up.
+- **Production environment** (`rg-colorcon-bff-prod-eus`) — same pattern as this entire
+  document, not started. Separate future work.
+- **Custom domain / DNS / TLS binding**, **production alerting**, **production HA
+  sizing**, **full CI/CD policy review** — all tracked as deferred-with-a-reason in
   [issue #1](https://github.com/bsarkarlabs-stack/bff-demo/issues/1), not overlooked.
-- Tag application (`client`, `application`, `environment`, `owner`, `managedBy`) across all
-  resources built in this session — tracked in
-  [issue #3](https://github.com/bsarkarlabs-stack/bff-demo/issues/3).
