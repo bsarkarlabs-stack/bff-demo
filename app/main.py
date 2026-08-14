@@ -23,6 +23,11 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/health/startup")
+async def health_startup() -> dict:
+    return {"status": "started"}
+
+
 @app.get("/health/live")
 async def health_live() -> dict:
     return {"status": "alive"}
