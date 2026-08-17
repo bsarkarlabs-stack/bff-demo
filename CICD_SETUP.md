@@ -158,25 +158,34 @@ The Environment name must exactly match what the workflow computes
 gh api --method PUT repos/bsarkarlabs-stack/bff-demo/environments/non-production
 ```
 
-Then set these seven secrets, scoped to that Environment (not repo-wide — so a `master`
-deploy can never see non-prod's identity, or vice versa):
+Only three values are actually sensitive — the rest are ordinary config and belong in
+GitHub Environment **variables** (`vars.*`), not secrets. Storing non-sensitive values as
+secrets doesn't add security, it just hides intent (and secrets are masked in logs, which
+makes debugging a bad `RESOURCE_GROUP` value harder than it needs to be).
+
+**Secrets** (scoped to the Environment, not repo-wide — so a `master` deploy can never see
+non-prod's identity, or vice versa):
 
 | Secret | Value (non-production) |
 |---|---|
 | `AZURE_CLIENT_ID` | `id-colorcon-bff-deploy-np-eus` client ID |
 | `AZURE_TENANT_ID` | the Azure AD tenant ID |
 | `AZURE_SUBSCRIPTION_ID` | the subscription ID |
+
+**Variables:**
+
+| Variable | Value (non-production) |
+|---|---|
 | `ACR_NAME` | `acrbffeus` (interim, shared) |
 | `RESOURCE_GROUP` | `rg-colourcon-bbf-np-eus` |
 | `CONTAINER_APP_NAME` | `ca-colorcon-bff-np-eus` |
 | `CONTAINER_APP_URL` | the app's `https://...azurecontainerapps.io` FQDN |
 
-**Use `printf`, not `echo`, piping into `gh secret set`.** `echo` appends a trailing
-newline that becomes part of the stored secret value (`CONTAINER_APP_NAME` silently becomes
-`"ca-colorcon-bff-np-eus\n"`), and every downstream `az` lookup then fails with the same
-not-found-shaped error as §4.2 — easy to mis-diagnose as another RBAC gap. This was hit
-for real the first time these secrets were set, using the exact `echo | gh secret set`
-pattern below in the "don't do this" form.
+**Use `printf`, not `echo`, piping into `gh secret set`/`gh variable set`.** `echo` appends
+a trailing newline that becomes part of the stored value (`CONTAINER_APP_NAME` silently
+becomes `"ca-colorcon-bff-np-eus\n"`), and every downstream `az` lookup then fails with the
+same not-found-shaped error as §4.2 — easy to mis-diagnose as another RBAC gap. This was
+hit for real the first time these were set.
 
 ```bash
 REPO=bsarkarlabs-stack/bff-demo
@@ -188,14 +197,20 @@ printf '%s' "$(az account show --query tenantId -o tsv)" \
   | gh secret set AZURE_TENANT_ID --env non-production --repo "$REPO"
 printf '%s' "$(az account show --query id -o tsv)" \
   | gh secret set AZURE_SUBSCRIPTION_ID --env non-production --repo "$REPO"
-printf '%s' "acrbffeus" | gh secret set ACR_NAME --env non-production --repo "$REPO"
-printf '%s' "$RG" | gh secret set RESOURCE_GROUP --env non-production --repo "$REPO"
-printf '%s' "ca-colorcon-bff-np-eus" | gh secret set CONTAINER_APP_NAME --env non-production --repo "$REPO"
-printf '%s' "https://<container-app-fqdn>" \
-  | gh secret set CONTAINER_APP_URL --env non-production --repo "$REPO"
+
+gh variable set ACR_NAME --env non-production --repo "$REPO" --body "acrbffeus"
+gh variable set RESOURCE_GROUP --env non-production --repo "$REPO" --body "$RG"
+gh variable set CONTAINER_APP_NAME --env non-production --repo "$REPO" --body "ca-colorcon-bff-np-eus"
+FQDN=$(az containerapp show -g "$RG" -n ca-colorcon-bff-np-eus --query properties.configuration.ingress.fqdn -o tsv)
+gh variable set CONTAINER_APP_URL --env non-production --repo "$REPO" --body "https://${FQDN}"
 
 gh secret list --env non-production --repo "$REPO"
+gh variable list --env non-production --repo "$REPO"
 ```
+
+In the workflow itself, reference these as `${{ vars.ACR_NAME }}` etc. — set once as
+job-level `env:` on the `deploy` job so individual steps can use plain `$ACR_NAME` rather
+than repeating the `${{ vars.* }}` expression everywhere.
 
 ---
 
@@ -203,15 +218,23 @@ gh secret list --env non-production --repo "$REPO"
 
 [.github/workflows/ci-cd.yml](.github/workflows/ci-cd.yml), two jobs:
 
-**`build`** (always runs, on push and PR): checkout → install deps → `docker build` →
-Trivy scan → save the image as a workflow artifact. Doesn't touch Azure — a PR from a fork
-can run this safely with no credentials at all.
+**`build`** (always runs, on push and PR): checkout → `docker build` → Trivy scan → save
+the image as a workflow artifact. Doesn't touch Azure — a PR from a fork can run this
+safely with no credentials at all. No Python setup/install step — nothing in this job runs
+Python (no lint/test step exists yet), and it would just be dead weight; add it back
+alongside a real test step once `app/` has one (issue #4).
 
-**`deploy`** (push events only, `needs: build`): downloads the artifact, logs into Azure
-via OIDC, pushes the image to ACR, updates the Container App, then curls `/health` to
-confirm the new revision actually came up before declaring success.
+**`deploy`** (push events only, `needs: build`), in order: download the artifact → OIDC
+login → push the image to ACR → **capture the currently-running image** (rollback target)
+→ update the Container App → **health check with retries** → **confirm the new revision's
+state** → roll back automatically if any of the last three steps failed → write a
+deployment summary regardless of outcome.
 
-Two config details worth knowing about, both learned by hitting them:
+A job-level `concurrency` group (`bff-deploy-${{ github.ref_name }}`,
+`cancel-in-progress: false`) means overlapping pushes to the same branch queue instead of
+racing each other mid-deploy.
+
+Config details worth knowing about, all learned by hitting them:
 
 - **Trivy tag format**: `aquasecurity/trivy-action` releases are tagged `v0.36.0`, not
   `0.36.0` — the unprefixed form fails immediately with `Unable to resolve action`, before
@@ -219,9 +242,22 @@ Two config details worth knowing about, both learned by hitting them:
 - **`ignore-unfixed: true`**: the Debian base image will always carry some CVEs with no
   published fix yet (blank `Fixed Version` in Trivy's own output). Gating `exit-code: 1`
   on those blocks CI permanently. `ignore-unfixed: true` scopes the gate to CVEs that are
-  actually fixable — which is also how the one real finding on this repo got caught: an
-  outdated `starlette`, pinned transitively via `fastapi==0.115.0`, with known CVEs fixed
-  in later `starlette` releases. Fixed by bumping `fastapi`.
+  actually fixable — which is also how two real findings on this repo got caught: an
+  outdated `starlette` (fixed by bumping `fastapi`), and later, nine fresh Debian OS
+  patches the base image's snapshot predated (fixed by adding `apt-get upgrade` to the
+  Dockerfile, so the build always pulls current OS security patches rather than trusting
+  the base image's age).
+- **Health check must run *before* the revision-state check, not after** — this app scales
+  to zero (`minReplicas=0`), and a new revision has no replica, and so never reports
+  `runningState: Running`, until something actually sends it traffic. Checking revision
+  state first is a self-inflicted deadlock: proven for real on this repo, where the wait
+  step timed out after 4 minutes and triggered a real (successful) rollback for an image
+  that was never actually broken. `curl --fail --retry N --retry-delay N` is what triggers
+  the cold start; check revision state only after it succeeds.
+- **Rollback is guarded**: `if: failure() && steps.previous.outcome == 'success'` — without
+  the second condition, a failure *before* the previous image was even captured (e.g. ACR
+  login) would trigger a rollback attempt with an empty image reference, turning one
+  failure into two.
 
 ---
 
