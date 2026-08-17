@@ -2,6 +2,11 @@ FROM python:3.12-slim AS base
 
 WORKDIR /app
 
+# Pull current OS security patches at build time rather than trust the base
+# image snapshot's age -- Debian ships fixes faster than upstream base
+# images get rebuilt, and Trivy (in CI) gates on exactly this gap.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
 RUN addgroup --system app && adduser --system --ingroup app app
 
 COPY requirements.txt .
