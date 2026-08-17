@@ -101,27 +101,33 @@ jobs:
             --resource-group "$RESOURCE_GROUP" \
             --image $ACR_NAME.azurecr.io/$IMAGE_NAME:${{ needs.build.outputs.image_tag }}
 
-      - name: Wait for new revision to be Running
+      - name: Identify new revision
         id: wait_revision
         run: |
           REVISION=$(az containerapp show --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" \
             --query properties.latestRevisionName -o tsv)
           echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
-          echo "Waiting for revision $REVISION to reach Running state..."
-          for i in $(seq 1 24); do
-            STATE=$(az containerapp revision show --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" \
-              --revision "$REVISION" --query properties.runningState -o tsv)
-            echo "  attempt $i: $STATE"
-            if [ "$STATE" = "Running" ]; then exit 0; fi
-            if [ "$STATE" = "Failed" ]; then echo "Revision failed to start"; exit 1; fi
-            sleep 10
-          done
-          echo "Timed out waiting for revision to reach Running state"
-          exit 1
+          echo "New revision: $REVISION"
 
+      # Runs before the revision-state check on purpose: this app scales to
+      # zero (minReplicas=0), and a new revision has no replica -- and so
+      # never reports runningState=Running -- until something actually
+      # sends it traffic. Health check first triggers that cold start;
+      # checking revision state before any request would just deadlock.
       - name: Health check
         run: |
-          curl --fail --retry 5 --retry-delay 5 "$CONTAINER_APP_URL/health"
+          curl --fail --retry 8 --retry-delay 8 "$CONTAINER_APP_URL/health"
+
+      - name: Confirm revision is Running
+        run: |
+          REVISION="${{ steps.wait_revision.outputs.revision }}"
+          STATE=$(az containerapp revision show --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" \
+            --revision "$REVISION" --query properties.runningState -o tsv)
+          echo "Revision $REVISION state: $STATE"
+          if [ "$STATE" != "Running" ] && [ "$STATE" != "RunningAtMaxScale" ]; then
+            echo "Revision is not in a healthy running state"
+            exit 1
+          fi
 
       - name: Rollback on failure
         if: failure() && steps.previous.outcome == 'success'
