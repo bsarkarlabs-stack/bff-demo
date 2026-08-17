@@ -749,10 +749,14 @@ pipeline run.
 
 ---
 
-### Step 20 — GitHub Environment + secrets
+### Step 20 — GitHub Environment + secrets/variables
 
-**Purpose:** Environment-scoped (not repo-wide) secrets, so a `master`-branch deploy can
-never see the `non-production` credentials or vice versa.
+**Purpose:** Environment-scoped (not repo-wide) config, so a `master`-branch deploy can
+never see the `non-production` credentials or vice versa. Only the three Azure OIDC
+identifiers are actually sensitive — `ACR_NAME`, `RESOURCE_GROUP`, `CONTAINER_APP_NAME`,
+and `CONTAINER_APP_URL` are ordinary config and belong in GitHub Environment **variables**,
+not secrets (storing non-sensitive values as secrets doesn't add security, it just masks
+them in logs and makes debugging harder). See CICD_SETUP.md §5 for the full reasoning.
 
 **Run:**
 ```bash
@@ -766,18 +770,23 @@ printf '%s' "$(az account show --query tenantId -o tsv)" \
   | gh secret set AZURE_TENANT_ID --env non-production --repo "$REPO"
 printf '%s' "$(az account show --query id -o tsv)" \
   | gh secret set AZURE_SUBSCRIPTION_ID --env non-production --repo "$REPO"
-printf '%s' "acrbffeus" | gh secret set ACR_NAME --env non-production --repo "$REPO"
-printf '%s' "$RG" | gh secret set RESOURCE_GROUP --env non-production --repo "$REPO"
-printf '%s' "ca-colorcon-bff-np-eus" | gh secret set CONTAINER_APP_NAME --env non-production --repo "$REPO"
-printf '%s' "https://<container-app-fqdn>" | gh secret set CONTAINER_APP_URL --env non-production --repo "$REPO"
+
+gh variable set ACR_NAME --env non-production --repo "$REPO" --body "acrbffeus"
+gh variable set RESOURCE_GROUP --env non-production --repo "$REPO" --body "$RG"
+gh variable set CONTAINER_APP_NAME --env non-production --repo "$REPO" --body "ca-colorcon-bff-np-eus"
+FQDN=$(az containerapp show -g "$RG" -n ca-colorcon-bff-np-eus --query properties.configuration.ingress.fqdn -o tsv)
+gh variable set CONTAINER_APP_URL --env non-production --repo "$REPO" --body "https://${FQDN}"
 ```
 
 **Verify:**
 ```bash
 gh secret list --env non-production --repo "$REPO"
+gh variable list --env non-production --repo "$REPO"
 ```
 
-**Expected result:** All 7 secrets listed with recent `Updated` timestamps.
+**Expected result:** 3 secrets (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+`AZURE_SUBSCRIPTION_ID`) and 4 variables (`ACR_NAME`, `RESOURCE_GROUP`,
+`CONTAINER_APP_NAME`, `CONTAINER_APP_URL`), all with recent `Updated` timestamps.
 
 **Next:** Safe to continue. **Never use `echo` in place of `printf` here** — see Section 6,
 issue 7.

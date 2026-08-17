@@ -54,10 +54,12 @@ never from environment variables or source control.
 ## CI/CD
 
 `.github/workflows/ci-cd.yml` builds the image, scans it with Trivy, pushes to Azure
-Container Registry, and updates the Azure Container App revision, authenticating to Azure
-via GitHub OIDC (no long-lived service principal secrets). Requires these repo/environment
-secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `ACR_NAME`,
-`CONTAINER_APP_NAME`, `RESOURCE_GROUP`, `CONTAINER_APP_URL`.
+Container Registry, updates the Azure Container App revision, waits for it to actually come
+up, health-checks it, and automatically rolls back to the previous image on failure —
+authenticating to Azure via GitHub OIDC (no long-lived service principal secrets). Requires
+these GitHub Environment secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+`AZURE_SUBSCRIPTION_ID`; and these variables: `ACR_NAME`, `CONTAINER_APP_NAME`,
+`RESOURCE_GROUP`, `CONTAINER_APP_URL`.
 
 `develop` deploys to the non-production Container App; `master` deploys to production
 (gated by the GitHub `production` environment's required reviewers). See
